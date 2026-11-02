@@ -115,10 +115,38 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   const receipts = new Map<string, PtcReceipt>()
   const announcements = new Map<string, AnnouncementState>()
   const hiding = createToolHiding(ctx)
+  // An agent's enabled set only grows: activations are permanent, and the catalog
+  // that feeds this reads a projection the commit folds on its own schedule. Without
+  // the union, an assembly that runs before that fold would re-hide the tool the
+  // commit just declared — visible as "I activated it and it disappeared".
+  const enabledSeen = new WeakMap<Agent, Set<string>>()
+
+  /** Install the hiding gate for one agent, never narrowing what it already saw. */
+  function applyHiding(agent: Agent, catalog: ToolCatalogItem[], enabled: ReadonlySet<string>): void {
+    const previous = enabledSeen.get(agent)
+    const merged = new Set(enabled)
+    if (previous !== undefined) {
+      for (const name of previous)
+        merged.add(name)
+    }
+    enabledSeen.set(agent, merged)
+    hiding.sync(agent, catalog, merged)
+  }
   // Latched from the first assembly: hosts that own tool declarations hand the
   // waterfall a presentation without them, and only those need hiding by
   // restriction. `undefined` means no assembly has revealed the host yet.
   let declarationsOwned: boolean | undefined
+  // Learn the host's declaration contract once, before any agent exists: whether the
+  // waterfall still receives `tools` decides if hiding is even needed, and the first
+  // turn has to know it too. A scope-less assembly is enough to tell.
+  const probe = ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
+    declarationsOwned ??= Array.isArray((assembly as AssembledPrompt).tools)
+    return next()
+  }, { prepend: true })
+  void Promise.resolve()
+    .then(async () => ctx.systemPrompt.assemble({}))
+    .catch(() => { })
+    .finally(() => probe())
   let approval: Context['approval'] | undefined
   let skills: Context['skills'] | undefined
   ctx.inject(['approval'], (owner) => {
@@ -194,7 +222,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       // The host keeps the declarations, so hide the un-activated ones with a
       // scoped restriction: that removes them from this agent's model surface and
       // from its callable set alike, which is what an inactive tool should be.
-      hiding.sync(agent, catalog, enabled)
+      applyHiding(agent, catalog, enabled)
       reportDeclarationsUnavailable()
     }
     const instructions = enabled.has('skill') && ctx.tools.get('skill', agent)
@@ -233,14 +261,14 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     return undefined
   })
   ctx.on('agent/created', ({ agent }) => {
-    // Hiding must be in place before a fresh agent's first assembly, so install it
-    // here once the host is known to own the declarations.
+    // Hiding must be in place before a fresh agent's first assembly, so the probe
+    // installed at load has to answer the host question by now.
     if (declarationsOwned !== false)
       return
     const policy = policySnapshot()
     hiding.suspend(agent)
     const catalog = catalogOf(agent, policy)
-    hiding.sync(agent, catalog, enabledToolNames(catalog, policy, []))
+    applyHiding(agent, catalog, enabledToolNames(catalog, policy, []))
   })
   ctx.on('agent/disposed', ({ agent }) => {
     hiding.forget(agent)
@@ -360,7 +388,10 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   }
 
   function catalogOf(agent: Agent, policy: ToolPolicy): ToolCatalogItem[] {
-    return buildToolCatalog(ctx.tools.schemas(agent), policy)
+    // The catalog is the directory `activate_tools` offers, so it must be read
+    // with the hiding gate lifted: with the gate in place every un-activated tool
+    // reads as absent and every activation answers `Not found`.
+    return hiding.readAll(agent, () => buildToolCatalog(ctx.tools.schemas(agent), policy))
   }
 
   async function renderSdk(agent: Agent, candidates: ReturnType<Context['tools']['schemas']>): Promise<string> {
@@ -501,6 +532,11 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
         },
       }
       const history = mergeActivation(historyOf(agent), accepted)
+      // The next step resolves its tool set BEFORE the assembly hook runs, so a
+      // gate refreshed there would leave exactly one step without the tool the
+      // model was just told it had. Install it on the COMMIT instead: the same
+      // turn's next step then both sees the declaration and may call it.
+      applyHiding(agent, catalog, enabledToolNames(catalog, policy, history.activatedToolIds))
       const receipt: ActivationReceipt = {
         ...accepted,
         authorized: true,

@@ -1,6 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ToolCatalogItem } from './types'
+import type { ViewHiding } from './view-hiding'
+import { installViewHiding } from './view-hiding'
 
 interface HidingState {
   restriction?: () => void
@@ -17,6 +19,16 @@ export interface ToolHiding {
   sync: (agent: Agent, catalog: readonly ToolCatalogItem[], enabled: ReadonlySet<string>) => HidingResult
   /** Lift this agent's restriction and forget its state. */
   forget: (agent: Agent) => void
+  /**
+   * Read something that MUST see every tool — the catalog above all — with the
+   * hiding gate lifted for exactly the length of the read.
+   *
+   * `activate_tools` builds its directory from `tools.schemas(agent)`, so a gate
+   * left installed makes the plugin blind to the very tools it offers: every
+   * activation would answer `Not found`. The gate goes back afterwards, because
+   * leaving it off would declare every tool on the next step.
+   */
+  readAll: <T>(agent: Agent, read: () => T) => T
   /** Drop the installed restriction so the next catalog read sees every tool. */
   suspend: (agent: Agent) => void
 }
@@ -37,8 +49,17 @@ export interface HidingResult {
  * surface *and* from its callable set, which is exactly what an un-activated tool
  * should be — discoverable through the directory, not declared.
  */
-export function createToolHiding(_ctx: Context): ToolHiding {
+export function createToolHiding(ctx: Context): ToolHiding {
   const states = new WeakMap<Agent, HidingState>()
+  // Filtering the host's view hides agent-scoped registrations too and takes effect
+  // on the first assembly; `restrict` stays as the fallback when no view is wrapable.
+  const viewHiding: ViewHiding | undefined = installViewHiding(ctx.tools)
+  if (viewHiding === undefined) {
+    // Worth saying out loud: it is the difference between hiding agent-scoped tools
+    // (hashline's, for one) and leaving them declared no matter what the user
+    // activates, and no later symptom names this cause.
+    console.warn('[dsh-tool-activator] host exposes no wrapable tools.view(); hiding falls back to a scoped restriction, which cannot hide tools registered into the agent\'s own scope')
+  }
 
   function stateOf(agent: Agent): HidingState {
     const existing = states.get(agent)
@@ -90,6 +111,15 @@ export function createToolHiding(_ctx: Context): ToolHiding {
         .map(tool => tool.name)
       // Every not-enabled name is a candidate; the host rejects the scope-local
       // ones by name and applyRestriction drops them, so nothing is lost here.
+      if (viewHiding !== undefined) {
+        // The gate is the allow-list itself, not the complement of what the catalog
+        // happened to hold when this ran: a scope-local tool that registers a moment
+        // later (an async agent effect) is outside `enabled` and stays hidden on the
+        // step that first sees it instead of leaking until the next assembly.
+        viewHiding.setGate(agent, enabled)
+        const hiddenNames = names.filter(name => !enabled.has(name))
+        return { deny: hiddenNames.length, total: names.length, installed: true }
+      }
       const candidates = names.filter(name => !enabled.has(name))
       const signature = candidates.join('\u0000')
       if (signature === state.signature)
@@ -111,7 +141,27 @@ export function createToolHiding(_ctx: Context): ToolHiding {
       }
       return { deny: applied.deny, total: names.length, installed: false, error: applied.error }
     },
+    readAll(agent, read) {
+      if (viewHiding !== undefined)
+        return viewHiding.transparent(agent, read)
+      // Restriction path: the mask hides the same tools from the catalog, so lift
+      // it for the read. Clearing the signature is what makes the caller's next
+      // `sync` install it again instead of trusting the disposed one.
+      const state = states.get(agent)
+      if (state === undefined)
+        return read()
+      const lift = state.restriction
+      state.restriction = undefined
+      state.signature = undefined
+      try {
+        return read()
+      }
+      finally {
+        lift?.()
+      }
+    },
     suspend(agent) {
+      viewHiding?.suspend(agent)
       const state = states.get(agent)
       if (state === undefined)
         return
@@ -120,6 +170,7 @@ export function createToolHiding(_ctx: Context): ToolHiding {
       state.signature = undefined
     },
     forget(agent) {
+      viewHiding?.forget(agent)
       const state = states.get(agent)
       if (state === undefined)
         return

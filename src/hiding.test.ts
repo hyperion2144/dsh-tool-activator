@@ -70,6 +70,22 @@ describe('createToolHiding', () => {
     expect(restrict).toHaveBeenLastCalledWith({ deny: ['bash'] })
   })
 
+  it('reads the catalog past its own restriction and reinstalls it afterwards', () => {
+    const { agent, context, restrict, lift } = harness()
+    const hiding = createToolHiding(context)
+    const tools = catalog(['read', 'write'])
+
+    hiding.sync(agent, tools, new Set(['read']))
+    // The directory has to list `write` even though the mask hides it: that is
+    // what makes `activate_tools` able to name it at all.
+    expect(hiding.readAll(agent, () => 'seen')).toBe('seen')
+    expect(lift).toHaveBeenCalledTimes(1)
+
+    hiding.sync(agent, tools, new Set(['read']))
+    expect(restrict).toHaveBeenCalledTimes(2)
+    expect(restrict).toHaveBeenLastCalledWith({ deny: ['write'] })
+  })
+
   it('lifts the restriction once everything is enabled', () => {
     const { agent, context, restrict, lift } = harness()
     const hiding = createToolHiding(context)
@@ -94,8 +110,10 @@ describe('createToolHiding', () => {
     hiding.sync(agent, catalog(['read']), new Set())
 
     expect(restrict).toHaveBeenCalledTimes(2)
-    expect(warn).toHaveBeenCalledTimes(1)
-    expect(warn.mock.calls[0]![0]).toContain('cannot hide inactive tools')
+    const degraded = warn.mock.calls.filter(call => String(call[0]).includes('cannot hide inactive tools'))
+    // Once per agent, whatever else the load reported about the same host.
+    expect(degraded).toHaveLength(1)
+    expect(warn.mock.calls.some(call => String(call[0]).includes('no wrapable tools.view()'))).toBe(true)
   })
 
   it('lifts the restriction and forgets the agent on disposal', () => {
