@@ -16,6 +16,7 @@ import { activationContent, activationEnvelope, activationHistorySchema, parseAc
 import { buildToolCatalog, enabledToolNames } from './catalog'
 import { validatePolicy } from './config'
 import { ACTIVATION_CONTEXT_NAME, ACTIVATION_CONTEXT_ORDER, ACTIVATION_PRODUCER, ACTIVATION_PROJECTION_KEY, ACTIVATION_VERSION, ACTIVATOR_SOURCE_KIND, ACTIVATOR_TOOL_NAME } from './constants'
+import { createToolHiding } from './hiding'
 import { emptyActivationHistory, foldActivationEvent, mergeActivation } from './history'
 import { filterPromptAssembly, immediateToolNames } from './prompt'
 import { provideToolActivatorRemote } from './remote'
@@ -63,15 +64,15 @@ interface AnnouncementState {
 /**
  * Hosts from dsh 0.2.2 on hand the assembly waterfall a presentation and merge the
  * provider-owned tool schemas afterwards, so this plugin can no longer hide tool
- * declarations there. Say that once per agent rather than degrading silently.
+ * declarations there. Say so once rather than on every agent.
  */
-const declarationsUnavailable = new WeakSet<Agent>()
+let reportedDeclarationsUnavailable = false
 
-function reportDeclarationsUnavailable(ctx: Context, agent: Agent): void {
-  if (declarationsUnavailable.has(agent))
+function reportDeclarationsUnavailable(): void {
+  if (reportedDeclarationsUnavailable)
     return
-  declarationsUnavailable.add(agent)
-  ctx.logger.warn('dsh-tool-activator: prompt assembly no longer carries tool declarations (dsh >= 0.2.2), so tool schemas stay provider-owned and cannot be hidden for this agent; sections and the activation directory still apply')
+  reportedDeclarationsUnavailable = true
+  console.warn('[dsh-tool-activator] prompt assembly no longer carries tool declarations (dsh >= 0.2.2); inactive tools are hidden with a scoped restriction instead of by filtering the assembly')
 }
 
 /** Fold one session event into what this session's head already declares. */
@@ -113,6 +114,11 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   const executions = new Map<ToolExecutionToken, ActivationExecution>()
   const receipts = new Map<string, PtcReceipt>()
   const announcements = new Map<string, AnnouncementState>()
+  const hiding = createToolHiding(ctx)
+  // Latched from the first assembly: hosts that own tool declarations hand the
+  // waterfall a presentation without them, and only those need hiding by
+  // restriction. `undefined` means no assembly has revealed the host yet.
+  let declarationsOwned: boolean | undefined
   let approval: Context['approval'] | undefined
   let skills: Context['skills'] | undefined
   ctx.inject(['approval'], (owner) => {
@@ -164,6 +170,14 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     if (context.scope !== agent)
       throw new Error('dsh-tool-activator requires the exact agent scope for prompt assembly')
     context.signal?.throwIfAborted()
+    // `tools` rides along only on hosts that still let this waterfall own the
+    // declarations; newer hosts merge the provider-owned schemas afterwards.
+    const ownsDeclarations = Array.isArray((assembly as AssembledPrompt).tools)
+    declarationsOwned = ownsDeclarations
+    // The agent view hides the tools this plugin restricted away, so lift the
+    // restriction for the length of the read; sync installs it again below.
+    if (!ownsDeclarations)
+      hiding.suspend(agent)
     const catalog = catalogOf(agent, policy)
     const history = historyOf(agent)
     const enabled = enabledToolNames(catalog, policy, history.activatedToolIds)
@@ -176,10 +190,13 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       // still has something to call under that name.
       return assembly
     }
-    // `tools` rides along only on hosts that still let this waterfall own the
-    // declarations; newer hosts merge the provider-owned schemas afterwards.
-    if (!Array.isArray((assembly as AssembledPrompt).tools))
-      reportDeclarationsUnavailable(ctx, agent)
+    if (!ownsDeclarations) {
+      // The host keeps the declarations, so hide the un-activated ones with a
+      // scoped restriction: that removes them from this agent's model surface and
+      // from its callable set alike, which is what an inactive tool should be.
+      hiding.sync(agent, catalog, enabled)
+      reportDeclarationsUnavailable()
+    }
     const instructions = enabled.has('skill') && ctx.tools.get('skill', agent)
       ? history.activatedSkills.flatMap(skill => skill.instructions === undefined ? [] : [skill.instructions])
       : []
@@ -215,7 +232,20 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     }
     return undefined
   })
-  ctx.on('agent/disposed', ({ agent }) => clearAgent(agent))
+  ctx.on('agent/created', ({ agent }) => {
+    // Hiding must be in place before a fresh agent's first assembly, so install it
+    // here once the host is known to own the declarations.
+    if (declarationsOwned !== false)
+      return
+    const policy = policySnapshot()
+    hiding.suspend(agent)
+    const catalog = catalogOf(agent, policy)
+    hiding.sync(agent, catalog, enabledToolNames(catalog, policy, []))
+  })
+  ctx.on('agent/disposed', ({ agent }) => {
+    hiding.forget(agent)
+    clearAgent(agent)
+  })
   ctx.on('session/event', (session, event) => {
     const state = announcements.get(session.id)
     if (state)
