@@ -5,11 +5,12 @@ import type {} from '@deepseek-ai/dsh-ptc-runtime'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SkillDefinition, SkillViewOptions } from '@deepseek-ai/dsh-skill'
+import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import type { ToolExecution, ToolExecutionResult, ToolExecutionToken, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { ToolActivatorConfig } from './config'
 import type { ToolPolicy } from './shared'
-import type { ActivateToolsParams, ActivationEnvelope, ActivationHistory, ActivationReceipt, ActivationResult, ToolCatalogItem } from './types'
+import type { ActivateToolsParams, ActivationEnvelope, ActivationHistory, ActivationReceipt, ActivationResult, AssembledPrompt, ToolCatalogItem } from './types'
 import { createDeveloperMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { activationContent, activationEnvelope, activationHistorySchema, parseActivation } from './activation'
 import { buildToolCatalog, enabledToolNames } from './catalog'
@@ -57,6 +58,20 @@ interface AnnouncementState {
    * `step/start`, so the last known coordinates are not writable in that gap.
    */
   stepOpen: boolean
+}
+
+/**
+ * Hosts from dsh 0.2.2 on hand the assembly waterfall a presentation and merge the
+ * provider-owned tool schemas afterwards, so this plugin can no longer hide tool
+ * declarations there. Say that once per agent rather than degrading silently.
+ */
+const declarationsUnavailable = new WeakSet<Agent>()
+
+function reportDeclarationsUnavailable(ctx: Context, agent: Agent): void {
+  if (declarationsUnavailable.has(agent))
+    return
+  declarationsUnavailable.add(agent)
+  ctx.logger.warn('dsh-tool-activator: prompt assembly no longer carries tool declarations (dsh >= 0.2.2), so tool schemas stay provider-owned and cannot be hidden for this agent; sections and the activation directory still apply')
 }
 
 /** Fold one session event into what this session's head already declares. */
@@ -161,6 +176,10 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       // still has something to call under that name.
       return assembly
     }
+    // `tools` rides along only on hosts that still let this waterfall own the
+    // declarations; newer hosts merge the provider-owned schemas afterwards.
+    if (!Array.isArray((assembly as AssembledPrompt).tools))
+      reportDeclarationsUnavailable(ctx, agent)
     const instructions = enabled.has('skill') && ctx.tools.get('skill', agent)
       ? history.activatedSkills.flatMap(skill => skill.instructions === undefined ? [] : [skill.instructions])
       : []
@@ -170,7 +189,10 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     const appending = await supportsToolAdditions(agent)
     if (appending)
       announce(agent, enabled, policy)
-    return filterPromptAssembly(assembly, catalog, policy, enabled, sdk, instructions, appending)
+    // The installed host types predate provider-owned declarations: they still
+    // declare the waterfall result as a full assembly, while 0.2.2 merges `tools`
+    // afterwards and accepts the presentation returned here.
+    return filterPromptAssembly(assembly as AssembledPrompt, catalog, policy, enabled, sdk, instructions, appending) as PromptAssembly
   })
   ctx.on('tools/ptc-dispatch-log', async (dispatch, next) => {
     const content = await next()
