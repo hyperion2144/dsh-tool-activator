@@ -4,7 +4,7 @@ import type { ToolPolicy } from './shared'
 import type { AssembledPrompt, CatalogEntry, PreparedPrompt, ToolCatalogItem } from './types'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { availableToolsForDiscovery, sectionToolDependencies } from './catalog'
-import { ACTIVATOR_TOOL_NAME, RUN_CODE_TOOL_NAME } from './constants'
+import { ACTIVATOR_TOOL_NAME, GROUPING_TOOL_NAME, RUN_CODE_TOOL_NAME } from './constants'
 
 export function escapeXml(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll('\'', '&apos;')
@@ -59,6 +59,7 @@ export function activatorSystemPrompt(skillAvailable: boolean): string {
     `Only basic and already activated tools have full schemas. The <available_tools> catalog lists additional tools without their schemas. When the user requests a task, choose only the relevant identifiers and call ${ACTIVATOR_TOOL_NAME} once with all needed identifiers and a concise reason before using those tools.`,
     'After activation, use the actual callable names listed in the result and the schemas and usage instructions provided on the next model call. Do not activate tools again when they are already available.',
     'Activation changes model-facing availability, not execution permission. Existing approval, sandbox, provider, and scope restrictions remain authoritative. Unknown, removed, or excluded tools cannot be made available by guessing identifiers.',
+    `The user decides how the tools are grouped: call ${GROUPING_TOOL_NAME} only when the user explicitly asks to organize or regroup the tools, and never reorganize the catalog on your own initiative.`,
     'When credentials are required, use an existing secure credential input mechanism. Never ask users to paste secrets into chat or claim a credential manager or sandbox integration that is not installed.',
   ]
   if (skillAvailable)

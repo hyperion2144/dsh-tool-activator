@@ -3,7 +3,7 @@ import type { ActivationCatalog, ActivationCatalogEntry } from '../types'
 import type { ConfigurationDraft, ConfigurationOp, ConfigurationScope, ToolActivatorConfigurationProps, ToolGroupDraft, ToolGroupShape } from './types'
 import type { SerialWriteQueue, WriteField } from './write-queue'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ACTIVATOR_TOOL_NAME } from '../constants'
+import { ACTIVATOR_TOOL_NAME, GROUPING_TOOL_NAME } from '../constants'
 import { Collapsible } from './collapsible'
 import { CLASSES, GROUPS_WRITE_DELAY_MS } from './constants'
 import { groupsSavable } from './groups'
@@ -63,6 +63,11 @@ function readGroups(scope: ConfigurationScope): ToolGroupDraft[] | undefined {
       sections: Array.isArray(group.sections) ? group.sections.filter((section): section is string => typeof section === 'string') : [],
     }]
   })
+}
+
+/** Stable identity of the host's groups: a change means somebody else wrote the document. */
+function groupsSignature(scope: ConfigurationScope): string {
+  return JSON.stringify(readGroups(scope) ?? [])
 }
 
 /** Groups are copied out of the draft before they reach the Host or a render. */
@@ -140,6 +145,11 @@ export function ToolActivatorConfiguration({ view, configScope, loadToolCatalog 
   const aliveRef = useRef(true)
   const groupsTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const pendingGroupsRef = useRef<ToolGroupDraft[] | undefined>(undefined)
+  // The groups this page last adopted from the host. A different signature on the
+  // next notification means the grouping was changed behind the page — by the
+  // model through the grouping tool, or by another window — and the catalog then
+  // shows entries the document no longer has.
+  const adoptedGroupsRef = useRef(groupsSignature(configScope))
 
   useEffect(() => {
     aliveRef.current = true
@@ -157,6 +167,7 @@ export function ToolActivatorConfiguration({ view, configScope, loadToolCatalog 
   /** Drop every local edit and take the document the Host actually holds. */
   const adoptHost = useCallback((): void => {
     const next = readDraft(configScope)
+    adoptedGroupsRef.current = groupsSignature(configScope)
     draftRef.current = next
     setDraft(next)
   }, [configScope])
@@ -194,8 +205,12 @@ export function ToolActivatorConfiguration({ view, configScope, loadToolCatalog 
       setFailure('宿主拒绝了本次修改：配置未通过校验，或与其他修改冲突。')
     // Only the entry set moves with groups; basicTools and the two switches are
     // read straight off the draft, so they need no round trip.
-    if (accepted && ops.some(op => op.path[0] === 'groups'))
+    if (accepted && ops.some(op => op.path[0] === 'groups')) {
+      // The write this page just made is not an external change: record the
+      // document it produced so the next notification does not refresh twice.
+      adoptedGroupsRef.current = groupsSignature(configScope)
       await refreshCatalog()
+    }
     return accepted
   }, [configScope, refreshCatalog])
 
@@ -223,10 +238,15 @@ export function ToolActivatorConfiguration({ view, configScope, loadToolCatalog 
       // older document mid-flight is what dropped a just-clicked tool.
       if (queue.busy() || pendingGroupsRef.current !== undefined)
         return
+      // An external grouping change is a new entry set, so the two tool lists
+      // have to be re-read as well; the draft alone would keep showing the old one.
+      const external = groupsSignature(configScope) !== adoptedGroupsRef.current
       adoptHost()
+      if (external)
+        void refreshCatalog()
     }
     return configScope.subscribe(sync)
-  }, [adoptHost, configScope, queue])
+  }, [adoptHost, configScope, queue, refreshCatalog])
 
   useEffect(() => {
     let cancelled = false
@@ -255,10 +275,14 @@ export function ToolActivatorConfiguration({ view, configScope, loadToolCatalog 
   )
   const requireApproval = draft.requireApproval ?? catalog?.requireApproval ?? true
   const autoGroupMcp = draft.autoGroupMcp ?? catalog?.autoGroupMcp ?? true
-  // The plugin pins its own activator, so no group may ever claim it — keeping
-  // it out of the choices is what stops a locked tool from being bundled.
+  // The plugin pins two of its own tools, so no group may ever claim them: the
+  // activator loads tools, and the grouping tool rewrites the grouping — bundling
+  // either would let a group hand out the machinery that defines groups.
   const lockedTools = useMemo(
-    () => (catalog?.entries ?? []).filter(entry => entry.identifier === ACTIVATOR_TOOL_NAME).flatMap(entry => entry.tools),
+    () => [
+      ...(catalog?.entries ?? []).filter(entry => entry.identifier === ACTIVATOR_TOOL_NAME).flatMap(entry => entry.tools),
+      GROUPING_TOOL_NAME,
+    ],
     [catalog],
   )
 
