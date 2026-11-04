@@ -14,12 +14,12 @@ import type { ToolPolicy } from './shared'
 import type { ActivateToolsParams, ActivationEnvelope, ActivationHistory, ActivationReceipt, ActivationResult, AssembledPrompt, GroupApplyReceipt, GroupingToolParams, GroupingToolResult, ToolCatalogItem } from './types'
 import { createDeveloperMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { activationContent, activationEnvelope, activationHistorySchema, parseActivation } from './activation'
+import { createToolHiding } from './admission-gating'
 import { buildToolCatalog, enabledToolNames } from './catalog'
 import { validatePolicy } from './config'
 import { ACTIVATION_PRODUCER, ACTIVATION_PROJECTION_KEY, ACTIVATION_STATE_VERSION, ACTIVATION_VERSION, ACTIVATOR_SOURCE_KIND, ACTIVATOR_TOOL_NAME, BASIC_GROUP_IDENTIFIER, LOCKED_TOOL_NAMES } from './constants'
 import { settingsNamespaceOf, settingsServiceOf, writeGroups } from './group-writer'
 import { applyGroupOps, groupingSnapshot } from './groups'
-import { createToolHiding } from './hiding'
 import { emptyActivationHistory, foldActivationEvent, mergeActivation } from './history'
 import { createCatalogPublisher } from './injection'
 import { immediateToolNames, preparePromptAssembly } from './prompt'
@@ -71,14 +71,25 @@ interface AnnouncementState {
  * declarations there. Say so once rather than on every agent.
  */
 let reportedDeclarationsUnavailable = false
+/**
+ * A host that owns the declarations and exposes no step admission leaves the plugin
+ * nowhere to hide an un-activated tool: the model would see all of them.
+ */
+let reportedMissingAdmission = false
 
 function reportDeclarationsUnavailable(): void {
   if (reportedDeclarationsUnavailable)
     return
   reportedDeclarationsUnavailable = true
-  console.warn('[dsh-tool-activator] prompt assembly no longer carries tool declarations (dsh >= 0.2.2); inactive tools are hidden with a scoped restriction instead of by filtering the assembly')
+  console.warn('[dsh-tool-activator] prompt assembly no longer carries tool declarations (dsh >= 0.2.2); inactive tools are hidden by narrowing the step admission instead of by filtering the assembly')
 }
 
+function reportMissingAdmission(): void {
+  if (reportedMissingAdmission)
+    return
+  reportedMissingAdmission = true
+  console.warn('[dsh-tool-activator] this host owns the tool declarations and exposes no tool admission (tools.resolve); inactive tools cannot be hidden from the model')
+}
 /** Fold one session event into what this session's head already declares. */
 function foldAnnouncement(state: AnnouncementState, event: SessionEvent): void {
   if (event.type === 'request/header') {
@@ -212,10 +223,10 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     .finally(() => probe())
   // A step resolves its tool set BEFORE it assembles, so an agent that already
   // existed when this plugin loaded (a restored session) would spend its first
-  // step with every tool declared — the assembly hook then hides them, which is
-  // the one-step-late "tools added, then removed" flicker. Answering inside
-  // `tools.view()` instead makes the first read correct no matter who created
-  // the agent or when this plugin loaded.
+  // step with every tool admitted — the assembly hook then narrows them, which is
+  // the one-step-late "tools added, then removed" flicker. Resolving the
+  // allow-list inside the admission instead makes the first resolution correct no
+  // matter who created the agent or when this plugin loaded.
   hiding.setGateResolver((agent) => {
     if (declarationsOwned === true)
       return
@@ -275,10 +286,6 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     // declarations; newer hosts merge the provider-owned schemas afterwards.
     const ownsDeclarations = Array.isArray((assembly as AssembledPrompt).tools)
     declarationsOwned = ownsDeclarations
-    // The agent view hides the tools this plugin restricted away, so lift the
-    // restriction for the length of the read; sync installs it again below.
-    if (!ownsDeclarations)
-      hiding.suspend(agent)
     const catalog = catalogOf(agent, policy)
     const history = historyOf(agent)
     const computed = enabledNamesOf(catalog, policy, history)
@@ -299,10 +306,13 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     // computed set.
     const enabled = ownsDeclarations ? computed : applyHiding(agent, catalog, computed)
     if (!ownsDeclarations) {
-      // The host keeps the declarations, so hide the un-activated ones with a
-      // scoped restriction: that removes them from this agent's model surface and
-      // from its callable set alike, which is what an inactive tool should be.
+      // The host owns the declarations, so the hiding happens where the model
+      // reads them: the step admission. Narrowing it removes the un-activated
+      // tools from this agent's model surface and from its callable set alike,
+      // which is what an inactive tool should be.
       reportDeclarationsUnavailable()
+      if (!hiding.installed)
+        reportMissingAdmission()
     }
     const instructions = enabled.has('skill') && ctx.tools.get('skill', agent)
       ? history.activatedSkills.flatMap(skill => skill.instructions === undefined ? [] : [skill.instructions])
@@ -366,7 +376,6 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     if (declarationsOwned !== false)
       return
     const policy = policySnapshot()
-    hiding.suspend(agent)
     const catalog = catalogOf(agent, policy)
     // A restored session's agent is new, but its session already carries the tools
     // it activated: the gate must keep them visible, or the first request after a
@@ -518,10 +527,10 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   }
 
   function catalogOf(agent: Agent, policy: ToolPolicy): ToolCatalogItem[] {
-    // The catalog is the directory `activate_tools` offers, so it must be read
-    // with the hiding gate lifted: with the gate in place every un-activated tool
-    // reads as absent and every activation answers `Not found`.
-    return hiding.readAll(agent, () => buildToolCatalog(ctx.tools.schemas(agent), policy))
+    // The catalog is the directory `activate_tools` offers. It reads the
+    // registry's real face, so every tool this installation can offer is in it —
+    // the activation narrows the model's access, not the registry's truth.
+    return buildToolCatalog(ctx.tools.schemas(agent), policy)
   }
 
   async function renderSdk(agent: Agent, candidates: ReturnType<Context['tools']['schemas']>): Promise<string> {

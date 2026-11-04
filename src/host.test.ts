@@ -7,6 +7,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import type { ToolActivatorConfig } from './config'
 import type { ToolPolicy } from './shared'
+import type { ActivationCatalog } from './types'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -24,7 +25,7 @@ import { ApprovalService, setApprovalPolicy } from '@deepseek-ai/dsh-user-approv
 import { afterEach, describe, expect, it } from 'vitest'
 import { receiptFromContent } from './activation'
 import { Config } from './config'
-import { ACTIVATION_PROJECTION_KEY, ACTIVATOR_SOURCE_KIND } from './constants'
+import { ACTIVATION_PROJECTION_KEY, ACTIVATOR_SOURCE_KIND, SETTINGS_REMOTE_NAMESPACE } from './constants'
 import * as plugin from './index'
 import { catalogMessages } from './injection'
 
@@ -34,6 +35,8 @@ const FIXTURE_CWD = join(tmpdir(), 'isolated-activator-fixture')
 /** Registered by the fixture but absent from `DEFAULT_POLICY.basicTools`, so it stays on-demand. */
 const DISCOVERABLE_TOOL = 'pwsh'
 const DISCOVERABLE_GUIDE = 'PWSh FULL GUIDE'
+/** Registered into an agent own scope by another plugin, the way hashline tools are. */
+const AGENT_SCOPED_TOOL = 'agent_scoped'
 
 class IntegrationPtcRuntime extends PtcRuntime {
   language = 'typescript'
@@ -146,6 +149,21 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
     }))
   }
   services.push(await ctx.plugin(ToolRuntime, { mode: options.mode ?? 'native' }))
+  // dsh 0.2.2 resolves a step admission before it assembles, and the provider
+  // reads THAT set instead of the registry. The rc.2 host has neither, so the
+  // fixture supplies the admission contract: a `resolve` that yields the scope's
+  // real face, which the plugin narrows to the enabled tools.
+  Object.defineProperty(ctx.tools, 'resolve', {
+    configurable: true,
+    writable: true,
+    value: async (context: { agent?: Agent }) => {
+      const visible = new Map(ctx.tools.schemas(context.agent).map(schema => [schema.name, schema]))
+      return {
+        dispose: () => { },
+        view: (scope?: unknown) => scope === context.agent ? visible : new Map(),
+      }
+    },
+  })
   if (options.approval)
     services.push(await ctx.plugin(ApprovalService, { policy: options.approvalPolicy ?? 'ask' }))
   if (options.skills)
@@ -1010,6 +1028,15 @@ describe('activating a tool refreshes the declaration list for the next inferenc
  * declarations, so this block emulates the newer contract instead.
  */
 describe('the 0.2.2 contract: the waterfall carries no tool declarations', () => {
+  /** The tools one step may call: the model-facing face, not the registry's. */
+  async function resolveStep(ctx: Context, agent: Agent): Promise<ReadonlyMap<string, unknown>> {
+    const tools = ctx.tools as unknown as {
+      resolve: (context: { agent: Agent, modelSelection: { provider: string, model: string }, signal: AbortSignal }) => Promise<{ view: (scope?: unknown) => ReadonlyMap<string, unknown> }>
+    }
+    const toolSet = await tools.resolve({ agent, modelSelection: { provider: 'fixture', model: 'fixture' }, signal: new AbortController().signal })
+    return toolSet.view(agent)
+  }
+
   it('keeps the restored activations visible on the very first read of a restored session', async () => {
     const { ctx, makeAgent } = await fixture({ withoutDeclarations: true })
     // The host contract is learned from the first scoped assembly; in production
@@ -1022,10 +1049,10 @@ describe('the 0.2.2 contract: the waterfall carries no tool declarations', () =>
     const serialized: SessionEvent[] = JSON.parse(JSON.stringify(original.events))
     const restored = await makeAgent('restored-session', serialized)
     // The first request after a restart resolves its tool set before anything
-    // else: the tools the session already activated must still be declared.
-    expect(ctx.tools.schemas(restored.agent).map(schema => schema.name)).toContain(DISCOVERABLE_TOOL)
+    // else: the tools the session already activated must still be admitted.
+    const admitted = await resolveStep(ctx, restored.agent)
+    expect([...admitted.keys()]).toContain(DISCOVERABLE_TOOL)
   })
-
   it('keeps the discoverable directory whole in the first prompt of a new session', async () => {
     const { ctx, makeAgent } = await fixture({ withoutDeclarations: true })
     const { agent } = await makeAgent('new-session')
@@ -1037,16 +1064,41 @@ describe('the 0.2.2 contract: the waterfall carries no tool declarations', () =>
     expect(text).toContain(`<tool identifier="${DISCOVERABLE_TOOL}" name="${DISCOVERABLE_TOOL}">`)
   })
 
+  it('lists a tool another plugin registered into the agent scope', async () => {
+    const { ctx, makeAgent } = await fixture({ withoutDeclarations: true })
+    const { agent } = await makeAgent('agent-scoped-tool')
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    // The agent's own scope is where another plugin puts a per-agent tool:
+    // `agent.ctx.tools` needs an inject declaration, so read the service instead.
+    const agentTools = (agent.ctx as unknown as { get: (key: string) => { register: (definition: unknown) => () => void } }).get('tools')
+    cleanups.push(agentTools.register(defineTool({
+      name: AGENT_SCOPED_TOOL,
+      description: 'Registered into the agent scope by another plugin',
+      parameters: { path: { type: 'string', required: true } },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute: async args => `${AGENT_SCOPED_TOOL}:${args.path}`,
+    })))
+    // The settings page reads the registry's real face: a tool another plugin put
+    // into the agent scope has to be listed, or the user can never activate it.
+    const remote = (ctx as unknown as { get: (key: string) => { catalog: () => ActivationCatalog } }).get(SETTINGS_REMOTE_NAMESPACE)
+    const catalog = remote.catalog()
+    expect(catalog.entries.some(entry => entry.tools.includes(AGENT_SCOPED_TOOL))).toBe(true)
+  })
+
   it('hides the un-activated tools on the first read of a restored agent', async () => {
     const { ctx, makeAgent, restored } = await fixture({ withoutDeclarations: true, restoredAgent: true })
     // The host contract is learned from the first scoped assembly; in production
     // the load-time probe already knows it.
     const { agent: probe } = await makeAgent('contract-probe')
     await ctx.systemPrompt.assemble({ scope: probe, agent: probe })
-    // A step resolves its tool set before it assembles, so this read is the one
-    // that has to be filtered: the agent predates the plugin, so it never saw
+    // A step resolves its tool set before it assembles, so this resolution is the one
+    // that has to be narrowed: the agent predates the plugin, so it never saw
     // `agent/created`.
-    expect(ctx.tools.schemas(restored!.agent).map(schema => schema.name)).not.toContain(DISCOVERABLE_TOOL)
+    const admitted = await resolveStep(ctx, restored!.agent)
+    expect([...admitted.keys()]).not.toContain(DISCOVERABLE_TOOL)
+    // The registry keeps its truth: the tool is registered, only the model may not
+    // call it yet. A plugin that registers a per-agent tool reads it back here.
+    expect(ctx.tools.schemas(restored!.agent).map(schema => schema.name)).toContain(DISCOVERABLE_TOOL)
   })
 })
 

@@ -434,6 +434,7 @@ export function ToolActivatorConfiguration({ view, configScope, loadToolCatalog 
                 {partition.pending.length === 0
                   ? <p className={CLASSES.help}>全部工具都已默认激活。</p>
                   : renderRows(partition.pending)}
+                <p className={CLASSES.help}>按会话注册的工具（例如 git-bash 的 bash）要先有会话在跑才会出现在这里。</p>
               </Collapsible>
               <section className={CLASSES.section}>
                 <h4 className={CLASSES.sectionTitle}>工具分组</h4>
