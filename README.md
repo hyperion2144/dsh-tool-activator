@@ -45,13 +45,21 @@
 
 此外，任意已安装插件的工具都可作为标识请求；开启 `autoGroupMcp` 时，`mcp__server__tool` 还会按 server 聚合为 `mcp.server`。
 
-实际可用集合将以 `<available_tools>` 目录呈现，该目录随提示词注入给模型，只有标识、名称和一句简述：
+实际可用集合将以 `<available_tools>` 目录呈现。该目录作为本插件自己的消息注入给模型，不占用宿主的运行时上下文快照，只有标识、名称和一句简述：
 
 ```xml
 <available_tools description="These tools are installed but not yet enabled. Use activate_tools to enable them when needed.">
   <tool identifier="web_search" name="web_search">Search the public web for current information.</tool>
   <tool identifier="mcp.mail" name="mail">send: Send a message through the mailbox.</tool>
 </available_tools>
+```
+
+已激活的条目只保留标识符与可调用的成员名：工具描述已经在请求头的声明里，不必再重复一遍。
+
+```xml
+<activated_tools>
+  <tool identifier="mcp.mail" names="send,receive"/>
+</activated_tools>
 ```
 
 模型可按需请求加载工具或组：

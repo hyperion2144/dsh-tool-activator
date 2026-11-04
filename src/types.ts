@@ -1,11 +1,58 @@
-import type { ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { ToolSchema, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import type { ToolGroup } from './shared'
 
+/** One entry of the tool catalog: what the model can still activate. */
+export interface CatalogEntry {
+  /** The identifier the model activates by. */
+  name: string
+  /** What this entry covers, in one line. */
+  description: string
+}
+
+/** One publication of the tool catalog. */
+export interface CatalogPublication {
+  /** The model-facing text of the whole catalog. */
+  text: string
+  /** The entries still available in this session, in catalog order. */
+  entries: readonly CatalogEntry[]
+}
+
+/**
+ * The source of this plugin's own messages: the developer message that
+ * declares an activated tool, and the catalog the model reads.
+ *
+ * The catalog form carries the entries it published, so a consumer presents
+ * the list instead of re-parsing the prose, and marks a replacement catalog so
+ * the consumer knows the earlier one no longer applies.
+ */
+export type ActivatorMessageSource
+  = | { readonly kind: 'tool-activator' }
+    | { readonly kind: 'tool-activator', readonly form: 'catalog', readonly entries: readonly CatalogEntry[], readonly update?: true }
+
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
-    'tool-activator': { kind: 'tool-activator' }
+    'tool-activator': ActivatorMessageSource
   }
+}
+
+/** The system prompt assembly and the catalog this plugin publishes beside it. */
+export interface PreparedPrompt {
+  /** The assembly with the tool-dependent sections removed: they travel with the catalog. */
+  assembly: AssembledPrompt
+  /** The catalog the model reads about the tools it may call. */
+  catalog: CatalogPublication
+}
+
+/** Publishes the tool catalog as this plugin's own message. */
+export interface CatalogPublisher {
+  /** Record the catalog an agent's next step would publish. */
+  prepare: (agent: Agent, catalog: CatalogPublication) => void
+  /** Forget the catalog: this agent has none to publish. */
+  forget: (agent: Agent) => void
+  /** The message that publishes the agent's catalog, or undefined when it did not change. */
+  publish: (agent: Agent) => UserMessage | undefined
 }
 
 export interface ActivateToolsParams {

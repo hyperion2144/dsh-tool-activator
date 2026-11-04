@@ -1,12 +1,18 @@
+import type { ContextForm } from '@deepseek-ai/dsh-llm'
+
 export const ACTIVATOR_TOOL_NAME = 'activate_tools'
 export const RUN_CODE_TOOL_NAME = 'run_code'
-/** Message source of the developer messages that declare activated tools. */
+/**
+ * Message source of this plugin's own contributions: the developer messages that
+ * declare activated tools and the catalog the model reads about them.
+ */
 export const ACTIVATOR_SOURCE_KIND = 'tool-activator'
+
+/** The host's own vocabulary for a republished catalog. */
+export const CATALOG_FORM = 'catalog' satisfies ContextForm
 export const ACTIVATION_PRODUCER = 'dsh-tool-activator'
 export const ACTIVATION_VERSION = 1
 export const ACTIVATION_PROJECTION_KEY = 'tool-activator:activation'
-export const ACTIVATION_CONTEXT_NAME = 'tool-activator:context'
-export const ACTIVATION_CONTEXT_ORDER = 200
 export const SETTINGS_REMOTE_NAMESPACE = 'toolActivator'
 
 export const FIRST_PARTY_SECTION_TOOLS: Readonly<Record<string, readonly string[]>> = {
