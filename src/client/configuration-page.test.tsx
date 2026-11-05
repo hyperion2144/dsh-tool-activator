@@ -1,6 +1,6 @@
 import type { ActivationCatalog } from '../types'
 import type { ConfigurationScope, ConfigurationScopeSnapshot } from './types'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ToolActivatorConfiguration } from './configuration-page'
 import { CLASSES } from './constants'
@@ -81,6 +81,29 @@ function controlledScope(value: Record<string, unknown>): ControlledScope {
 async function openToolLists(): Promise<void> {
   fireEvent.click(await screen.findByRole('button', { name: /^默认激活工具/ }))
   fireEvent.click(screen.getByRole('button', { name: /^已安装但需先激活/ }))
+}
+
+/** A scope somebody else can write to, as the model does through the grouping tool. */
+function liveScope(value: Record<string, unknown>): { scope: ConfigurationScope, hostWrites: (next: Record<string, unknown>) => void } {
+  let snapshot: ConfigurationScopeSnapshot = { revision: 3, status: 'ready', value, writable: true }
+  const listeners = new Set<() => void>()
+  return {
+    scope: {
+      getSnapshot: () => snapshot,
+      mutate: vi.fn(async () => true),
+      subscribe: (listener: () => void) => {
+        listeners.add(listener)
+        return () => {
+          listeners.delete(listener)
+        }
+      },
+    },
+    hostWrites: (next: Record<string, unknown>) => {
+      snapshot = { ...snapshot, revision: (snapshot.revision ?? 0) + 1, value: next }
+      for (const listener of listeners)
+        listener()
+    },
+  }
 }
 
 describe('tool configuration page', () => {
@@ -514,6 +537,7 @@ describe('tool configuration page', () => {
       entries: [
         { identifier: 'activate_tools', name: 'activate_tools', description: 'Enable tools on demand', tools: ['activate_tools'] },
         { identifier: 'read', name: 'read', description: 'Read a file', tools: ['read'] },
+        { identifier: 'group_tools', name: 'group_tools', description: 'Organize the groups', tools: ['group_tools'] },
       ],
       groups: [],
       requireApproval: true,
@@ -521,9 +545,10 @@ describe('tool configuration page', () => {
     const scope = scopeOf({ groups: [{ identifier: 'files', name: 'Files', description: '', tools: ['read'], sections: [] }] })
     renderPage(scope, async () => custom)
 
-    // The page pins the activator itself, so no group may bundle it.
+    // The page pins the tools that define the catalog, so no group may bundle them.
     expect(await screen.findByLabelText('read')).toBeTruthy()
     expect(screen.queryByLabelText('activate_tools')).toBeNull()
+    expect(screen.queryByLabelText('group_tools')).toBeNull()
   })
 
   it('reloads the catalog once a group write lands', async () => {
@@ -542,5 +567,34 @@ describe('tool configuration page', () => {
     // reading the Host again.
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2), { timeout: 2000 })
     expect(await screen.findByText('file group')).toBeTruthy()
+  })
+
+  it('re-reads the catalog when the grouping is changed behind the page', async () => {
+    const { scope, hostWrites } = liveScope({ groups: [] })
+    const load = vi.fn().mockResolvedValue(CATALOG)
+    renderPage(scope, load)
+    await waitFor(() => expect(load).toHaveBeenCalledTimes(1))
+
+    // The grouping tool writes the document: the two tool lists now miss every
+    // entry that belongs to the new group.
+    act(() => {
+      hostWrites({ groups: [{ identifier: 'files', name: 'Files', description: '', tools: ['read'], sections: [] }] })
+    })
+
+    await waitFor(() => expect(load).toHaveBeenCalledTimes(2))
+  })
+
+  it('does not re-read the catalog for a change that leaves the grouping alone', async () => {
+    const { scope, hostWrites } = liveScope({ basicTools: ['read'], groups: [] })
+    const load = vi.fn().mockResolvedValue(CATALOG)
+    renderPage(scope, load)
+    await waitFor(() => expect(load).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      hostWrites({ basicTools: ['read', 'write'], groups: [] })
+    })
+
+    // The entry set did not move, so the tool lists the page already has are still right.
+    expect(load).toHaveBeenCalledTimes(1)
   })
 })

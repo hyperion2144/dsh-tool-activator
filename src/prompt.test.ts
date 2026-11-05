@@ -103,6 +103,14 @@ describe('activatorSystemPrompt', () => {
     expect(activatorSystemPrompt(true)).toContain('may fall back to that same skill loader')
     expect(activatorSystemPrompt(false)).not.toContain('skill loader')
   })
+
+  it('binds the grouping tool to the user request instead of the own initiative of the model', () => {
+    const result = activatorSystemPrompt(false)
+
+    expect(result).toContain('The user decides how the tools are grouped')
+    expect(result).toContain('call group_tools only when the user explicitly asks to organize or regroup the tools')
+    expect(result).toContain('never reorganize the catalog on your own initiative')
+  })
 })
 
 describe('selectToolSections', () => {

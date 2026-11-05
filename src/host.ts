@@ -9,13 +9,16 @@ import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import type { ToolExecution, ToolExecutionResult, ToolExecutionToken, ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type { ToolActivatorConfig } from './config'
+import type { GroupingFacts } from './groups'
 import type { ToolPolicy } from './shared'
-import type { ActivateToolsParams, ActivationEnvelope, ActivationHistory, ActivationReceipt, ActivationResult, AssembledPrompt, ToolCatalogItem } from './types'
+import type { ActivateToolsParams, ActivationEnvelope, ActivationHistory, ActivationReceipt, ActivationResult, AssembledPrompt, GroupApplyReceipt, GroupingToolParams, GroupingToolResult, ToolCatalogItem } from './types'
 import { createDeveloperMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { activationContent, activationEnvelope, activationHistorySchema, parseActivation } from './activation'
 import { buildToolCatalog, enabledToolNames } from './catalog'
 import { validatePolicy } from './config'
-import { ACTIVATION_PRODUCER, ACTIVATION_PROJECTION_KEY, ACTIVATION_VERSION, ACTIVATOR_SOURCE_KIND, ACTIVATOR_TOOL_NAME } from './constants'
+import { ACTIVATION_PRODUCER, ACTIVATION_PROJECTION_KEY, ACTIVATION_STATE_VERSION, ACTIVATION_VERSION, ACTIVATOR_SOURCE_KIND, ACTIVATOR_TOOL_NAME, BASIC_GROUP_IDENTIFIER, LOCKED_TOOL_NAMES } from './constants'
+import { settingsNamespaceOf, settingsServiceOf, writeGroups } from './group-writer'
+import { applyGroupOps, groupingSnapshot } from './groups'
 import { createToolHiding } from './hiding'
 import { emptyActivationHistory, foldActivationEvent, mergeActivation } from './history'
 import { createCatalogPublisher } from './injection'
@@ -23,7 +26,7 @@ import { immediateToolNames, preparePromptAssembly } from './prompt'
 import { provideToolActivatorRemote } from './remote'
 import { ActivatorExecutionRuntime } from './runtime'
 import { loadToolSdkRenderers } from './sdk-render'
-import { createActivatorTool } from './tool'
+import { createActivatorTool, createGroupingTool } from './tool'
 import './session-projection'
 
 interface ActivationExecution {
@@ -110,6 +113,43 @@ function announcedNames(session: Session): Set<string> {
   return names
 }
 
+/**
+ * Whether an applied batch changed anything at all. A batch that changed
+ * nothing has no reason to be written back into the configuration.
+ */
+function changedAnything(receipt: GroupApplyReceipt): boolean {
+  return receipt.created.length > 0 || receipt.updated.length > 0
+    || receipt.removed.length > 0 || receipt.renamed.length > 0
+}
+
+/**
+ * The tool names a rename or a removal would drop from the activation account.
+ *
+ * A group identifier dies with the group, so a session that activated the group
+ * loses its claim on the members once the group is renamed or removed. The names
+ * travel with the result instead: the session log folds them into the account,
+ * and the tools the session already had stay callable.
+ */
+function migrationNames(facts: GroupingFacts, receipt: GroupApplyReceipt, history: ActivationHistory): string[] {
+  const targets = [...receipt.renamed.map(item => item.from), ...receipt.removed]
+  const known = new Set(history.activatedToolNames ?? [])
+  const names: string[] = []
+  for (const identifier of targets) {
+    if (!history.activatedToolIds.includes(identifier))
+      continue
+    const group = facts.groups.find(entry => entry.identifier === identifier)
+    if (!group)
+      continue
+    for (const tool of group.tools) {
+      if (!known.has(tool)) {
+        known.add(tool)
+        names.push(tool)
+      }
+    }
+  }
+  return names
+}
+
 export function installToolActivator(ctx: Context, config: ToolActivatorConfig): void {
   const lifetime = new AbortController()
   const executions = new Map<ToolExecutionToken, ActivationExecution>()
@@ -139,8 +179,12 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   // commit just declared — visible as "I activated it and it disappeared".
   const enabledSeen = new WeakMap<Agent, Set<string>>()
 
-  /** Install the hiding gate for one agent, never narrowing what it already saw. */
-  function applyHiding(agent: Agent, catalog: ToolCatalogItem[], enabled: ReadonlySet<string>): void {
+  /**
+   * Install the hiding gate for one agent, never narrowing what it already saw. The
+   * merged set is returned: the prompt has to present exactly what the gate lets
+   * the model call, or a tool the gate keeps would be offered as inactive.
+   */
+  function applyHiding(agent: Agent, catalog: ToolCatalogItem[], enabled: ReadonlySet<string>): Set<string> {
     const previous = enabledSeen.get(agent)
     const merged = new Set(enabled)
     if (previous !== undefined) {
@@ -149,6 +193,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     }
     enabledSeen.set(agent, merged)
     hiding.sync(agent, catalog, merged)
+    return merged
   }
   // Latched from the first assembly: hosts that own tool declarations hand the
   // waterfall a presentation without them, and only those need hiding by
@@ -176,7 +221,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       return
     const policy = policySnapshot()
     const catalog = catalogOf(agent, policy)
-    applyHiding(agent, catalog, enabledToolNames(catalog, policy, activatedIdsOf(agent)))
+    applyHiding(agent, catalog, enabledNamesOf(catalog, policy, activatedHistoryOf(agent)))
   })
   let approval: Context['approval'] | undefined
   let skills: Context['skills'] | undefined
@@ -198,6 +243,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   })
   const tool = createActivatorTool(execute)
   tool.finalizeContent = finalize
+  const groupingTool = createGroupingTool(executeGrouping)
 
   ctx.effect(() => () => {
     lifetime.abort()
@@ -208,11 +254,12 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   ctx.sessionProjections.register({
     key: ACTIVATION_PROJECTION_KEY,
     stateSchema: activationHistorySchema,
-    stateVersion: ACTIVATION_VERSION,
+    stateVersion: ACTIVATION_STATE_VERSION,
     init: emptyActivationHistory,
     apply: foldActivationEvent,
   })
   ctx.tools.register(tool)
+  ctx.tools.register(groupingTool)
   provideToolActivatorRemote(ctx, policySnapshot)
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     const assembly = await next()
@@ -234,7 +281,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       hiding.suspend(agent)
     const catalog = catalogOf(agent, policy)
     const history = historyOf(agent)
-    const enabled = enabledToolNames(catalog, policy, history.activatedToolIds)
+    const computed = enabledNamesOf(catalog, policy, history)
     if (ctx.tools.get(ACTIVATOR_TOOL_NAME, agent) === undefined) {
       // Nothing named activate_tools is visible in this scope — a restriction
       // denied it or the host never exposed it. Hiding the discoverable tools
@@ -246,11 +293,15 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       publisher.forget(agent)
       return assembly
     }
+    // The presentation and the gate read the same set: the gate keeps what the
+    // session already had, so the prompt presents what the model may actually call.
+    // A host that owns the declarations has no gate to follow, so it keeps the
+    // computed set.
+    const enabled = ownsDeclarations ? computed : applyHiding(agent, catalog, computed)
     if (!ownsDeclarations) {
       // The host keeps the declarations, so hide the un-activated ones with a
       // scoped restriction: that removes them from this agent's model surface and
       // from its callable set alike, which is what an inactive tool should be.
-      applyHiding(agent, catalog, enabled)
       reportDeclarationsUnavailable()
     }
     const instructions = enabled.has('skill') && ctx.tools.get('skill', agent)
@@ -320,7 +371,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     // A restored session's agent is new, but its session already carries the tools
     // it activated: the gate must keep them visible, or the first request after a
     // restart would drop tools the model had already been given.
-    applyHiding(agent, catalog, enabledToolNames(catalog, policy, activatedIdsOf(agent)))
+    applyHiding(agent, catalog, enabledNamesOf(catalog, policy, activatedHistoryOf(agent)))
   })
   ctx.on('agent/disposed', ({ agent }) => {
     hiding.forget(agent)
@@ -444,17 +495,26 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   }
 
   /**
-   * The tools this session already activated. An empty list is the safe answer: the
-   * gate then hides what was never activated, and the next assembly widens it from
+   * The activation history this session recovered. An empty history is the safe answer:
+   * the gate then hides what was never activated, and the next assembly widens it from
    * the recovered history.
    */
-  function activatedIdsOf(agent: Agent): readonly string[] {
+  function activatedHistoryOf(agent: Agent): ActivationHistory {
     try {
-      return historyOf(agent).activatedToolIds
+      return historyOf(agent)
     }
     catch {
-      return []
+      return emptyActivationHistory()
     }
+  }
+
+  /**
+   * The tools this session may call: the basic tools, the activated entries and the
+   * activated tool names. The names are what survives a group that was renamed or
+   * split after the session activated it, so they count on their own.
+   */
+  function enabledNamesOf(catalog: ToolCatalogItem[], policy: ToolPolicy, history: ActivationHistory): Set<string> {
+    return enabledToolNames(catalog, policy, history.activatedToolIds, history.activatedToolNames)
   }
 
   function catalogOf(agent: Agent, policy: ToolPolicy): ToolCatalogItem[] {
@@ -522,13 +582,13 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     const policy = requireExecution(agent, record, signal)
     const catalog = catalogOf(agent, policy)
     const history = historyOf(agent)
-    const enabled = enabledToolNames(catalog, policy, history.activatedToolIds)
+    const enabled = enabledNamesOf(catalog, policy, history)
     const active = catalog.filter(entry => entry.tools.every(schema => enabled.has(schema.name))).map(entry => entry.identifier)
     const skillDefinition = ctx.tools.get('skill', agent)
     const skillService = skills
     let skillCall = 0
     const runtime = new ActivatorExecutionRuntime({
-      getActivatedToolIds: () => active,
+      getActiveIdentifiers: identifiers => active.filter(identifier => identifiers.includes(identifier)),
       getToolManifests: async identifiers => catalog.filter(entry => identifiers.includes(entry.identifier)),
       markActivated: () => {},
       ...(enabled.has('skill') && skillDefinition && skillService
@@ -537,7 +597,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
               const options = await lookupOptions(agent, signal)
               const skill = await loadSkill(skillService, name, options)
               const current = requireExecution(agent, record, signal)
-              const currentEnabled = enabledToolNames(catalogOf(agent, current), current, historyOf(agent).activatedToolIds)
+              const currentEnabled = enabledNamesOf(catalogOf(agent, current), current, historyOf(agent))
               if (!skill || !currentEnabled.has('skill') || ctx.tools.get('skill', agent) !== skillDefinition || skills !== skillService)
                 return { content: `Skill ${name} is not available.`, success: false }
               const result = await ctx.tools.execute({
@@ -576,6 +636,61 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     return result
   }
 
+  /**
+   * Read the grouping state of the current scope, or write a batch of group
+   * edits into the plugin's own configuration.
+   *
+   * The batch is all-or-nothing: a rejected batch answers with every problem it
+   * has and writes nothing, and an accepted batch is written as one conditional
+   * document mutation.
+   */
+  async function executeGrouping(args: GroupingToolParams, exec: ToolRunContext): Promise<GroupingToolResult> {
+    const agent = requireAgent(exec.agent)
+    const signal = AbortSignal.any([exec.signal, lifetime.signal])
+    signal.throwIfAborted()
+    const policy = policySnapshot()
+    const catalog = catalogOf(agent, policy)
+    const facts: GroupingFacts = {
+      groups: policy.groups,
+      tools: catalog.flatMap(entry => entry.tools.map(tool => tool.name)),
+      basicTools: policy.basicTools,
+      lockedTools: LOCKED_TOOL_NAMES,
+    }
+    if (args.action !== 'apply')
+      return { action: 'list', ...groupingSnapshot(facts) }
+    // `apply` without an operation is a malformed call, not a no-op: answering
+    // with an empty receipt would tell the model it changed something it did not.
+    if ((args.ops ?? []).length === 0)
+      throw new Error('The "apply" action needs at least one operation in "ops"; no change was made.')
+    const outcome = applyGroupOps(facts, args.ops ?? [])
+    if (outcome.problems.length > 0)
+      return { action: 'apply', problems: outcome.problems }
+    // The members of a renamed or removed group would drop out of the account with
+    // the identifier that died with the group, so they travel with the result and
+    // the session log folds them back in.
+    const migrated = migrationNames(facts, outcome.receipt, activatedHistoryOf(agent))
+    // A batch that changed nothing is not written back: the write is a
+    // read-modify-write of the whole document, and rewriting it unchanged
+    // could only overwrite what the user changed in the meantime. The names still
+    // travel: they are the only thing such a call has to account for.
+    if (!changedAnything(outcome.receipt))
+      return { action: 'apply', receipt: outcome.receipt, ...(migrated.length > 0 ? { migrated } : {}) }
+    const service = settingsServiceOf(ctx)
+    if (!service) {
+      throw new Error('dsh-tool-activator cannot write tool groups: this host does not provide the settings service, so no change was made. Ask the user to edit the groups in the tool activator settings.')
+    }
+    const ns = settingsNamespaceOf(ctx)
+    if (!ns) {
+      throw new Error('dsh-tool-activator cannot write tool groups: this plugin instance has no settings namespace, so no change was made. Ask the user to edit the groups in the tool activator settings.')
+    }
+    signal.throwIfAborted()
+    // The always-loaded set is written in the same mutation as the groups, but
+    // only when this batch actually touched it.
+    const basicChanged = outcome.receipt.updated.includes(BASIC_GROUP_IDENTIFIER)
+    await writeGroups(service, ns, outcome.next, signal, basicChanged ? outcome.nextBasicTools : undefined)
+    return { action: 'apply', receipt: outcome.receipt, ...(migrated.length > 0 ? { migrated } : {}) }
+  }
+
   function finalize(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): ContentBlock[] | undefined {
     if (result.isError)
       return undefined
@@ -592,7 +707,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
         return undefined
       const catalog = catalogOf(agent, policy)
       const available = new Set(catalog.map(item => item.identifier))
-      const enabled = enabledToolNames(catalog, policy, historyOf(agent).activatedToolIds)
+      const enabled = enabledNamesOf(catalog, policy, historyOf(agent))
       const accepted: ActivationEnvelope = {
         ...activation,
         state: {
@@ -606,7 +721,7 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       // gate refreshed there would leave exactly one step without the tool the
       // model was just told it had. Install it on the COMMIT instead: the same
       // turn's next step then both sees the declaration and may call it.
-      applyHiding(agent, catalog, enabledToolNames(catalog, policy, history.activatedToolIds))
+      applyHiding(agent, catalog, enabledNamesOf(catalog, policy, history))
       const receipt: ActivationReceipt = {
         ...accepted,
         authorized: true,

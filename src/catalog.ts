@@ -62,12 +62,16 @@ export function buildToolCatalog(schemas: readonly ToolSchema[], policy: ToolPol
   return entries.sort((a, b) => a.identifier < b.identifier ? -1 : a.identifier > b.identifier ? 1 : 0)
 }
 
-export function enabledToolNames(catalog: readonly ToolCatalogItem[], policy: ToolPolicy, activatedIds: readonly string[]): Set<string> {
+export function enabledToolNames(catalog: readonly ToolCatalogItem[], policy: ToolPolicy, activatedIds: readonly string[], activatedToolNames: readonly string[] = []): Set<string> {
   const enabled = new Set<string>([ACTIVATOR_TOOL_NAME, 'run_code'])
   const active = new Set(activatedIds)
+  const activeNames = new Set(activatedToolNames)
   for (const entry of catalog) {
     for (const tool of entry.tools) {
-      if (policy.basicTools.includes(tool.name) || active.has(entry.identifier))
+      // A group identifier dies with the group, so the names the session activated
+      // count on their own: a renamed or split group must not take the tools it
+      // carried away from the session that already has them.
+      if (policy.basicTools.includes(tool.name) || active.has(entry.identifier) || activeNames.has(tool.name))
         enabled.add(tool.name)
     }
   }
