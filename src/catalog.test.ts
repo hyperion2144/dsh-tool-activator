@@ -237,6 +237,24 @@ describe('enabledToolNames', () => {
       'write',
     ])
   })
+
+  it('seeds a basic tool that has not registered yet into the allow set', () => {
+    // The gate reads the catalog at admission time; a basic tool that registers
+    // later (a per-agent bash) must still pass, because the allow set is a
+    // policy/history function rather than a registry snapshot.
+    const current = policy({ basicTools: ['read', 'bash'] })
+    const catalog = buildToolCatalog([tool('read')], current)
+
+    expect([...enabledToolNames(catalog, current, [])].sort()).toEqual(['activate_tools', 'bash', 'read', 'run_code'])
+  })
+
+  it('seeds activated tool names that have not registered yet', () => {
+    const current = policy({ groups: [group('editor', ['read', 'write'])] })
+    const catalog = buildToolCatalog([tool('read')], current)
+
+    expect([...enabledToolNames(catalog, current, ['editor'], ['write', 'apply_patch'])].sort())
+      .toEqual(['activate_tools', 'apply_patch', 'read', 'run_code', 'write'])
+  })
 })
 
 describe('availableToolsForDiscovery', () => {
