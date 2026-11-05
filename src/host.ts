@@ -15,10 +15,11 @@ import { createDeveloperMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { activationContent, activationEnvelope, activationHistorySchema, parseActivation } from './activation'
 import { buildToolCatalog, enabledToolNames } from './catalog'
 import { validatePolicy } from './config'
-import { ACTIVATION_CONTEXT_NAME, ACTIVATION_CONTEXT_ORDER, ACTIVATION_PRODUCER, ACTIVATION_PROJECTION_KEY, ACTIVATION_VERSION, ACTIVATOR_SOURCE_KIND, ACTIVATOR_TOOL_NAME } from './constants'
+import { ACTIVATION_PRODUCER, ACTIVATION_PROJECTION_KEY, ACTIVATION_VERSION, ACTIVATOR_SOURCE_KIND, ACTIVATOR_TOOL_NAME } from './constants'
 import { createToolHiding } from './hiding'
 import { emptyActivationHistory, foldActivationEvent, mergeActivation } from './history'
-import { filterPromptAssembly, immediateToolNames } from './prompt'
+import { createCatalogPublisher } from './injection'
+import { immediateToolNames, preparePromptAssembly } from './prompt'
 import { provideToolActivatorRemote } from './remote'
 import { ActivatorExecutionRuntime } from './runtime'
 import { loadToolSdkRenderers } from './sdk-render'
@@ -115,6 +116,23 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   const receipts = new Map<string, PtcReceipt>()
   const announcements = new Map<string, AnnouncementState>()
   const hiding = createToolHiding(ctx)
+  /** Publishes the tool catalog as this plugin's own message. */
+  const publisher = createCatalogPublisher()
+  /** Sessions this plugin assembled a prompt for. */
+  const assembledSessions = new WeakSet<Session>()
+  /** Sessions this plugin admitted a catalog into. */
+  const admittedSessions = new WeakSet<Session>()
+  let reportedMissingStepAdmission = false
+  /**
+   * The host admits a step through its waterfall; without it the catalog can
+   * never reach the model, and the plugin would silently do half its job.
+   */
+  function reportMissingStepAdmission(): void {
+    if (reportedMissingStepAdmission)
+      return
+    reportedMissingStepAdmission = true
+    console.warn('[dsh-tool-activator] the host starts steps without dispatching agent/pre-step, so the tool catalog cannot reach the model')
+  }
   // An agent's enabled set only grows: activations are permanent, and the catalog
   // that feeds this reads a projection the commit folds on its own schedule. Without
   // the union, an assembly that runs before that fold would re-hide the tool the
@@ -196,18 +214,13 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
   })
   ctx.tools.register(tool)
   provideToolActivatorRemote(ctx, policySnapshot)
-  ctx.systemPrompt.variable('tool_activator_context', () => '')
-  ctx.systemPrompt.context({
-    name: ACTIVATION_CONTEXT_NAME,
-    order: ACTIVATION_CONTEXT_ORDER,
-    text: '{{tool_activator_context}}',
-  })
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     const assembly = await next()
     const policy = policySnapshot()
     if (!context.agent)
       return assembly
     const agent = requireAgent(context.agent)
+    assembledSessions.add(agent.session)
     if (context.scope !== agent)
       throw new Error('dsh-tool-activator requires the exact agent scope for prompt assembly')
     context.signal?.throwIfAborted()
@@ -229,6 +242,8 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
       // untouched assembly instead. A scope-local registration of the same name
       // merely shadows ours, and filtering stays correct there because the model
       // still has something to call under that name.
+      // Without the activator the model gets no catalog to read.
+      publisher.forget(agent)
       return assembly
     }
     if (!ownsDeclarations) {
@@ -250,7 +265,28 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     // The installed host types predate provider-owned declarations: they still
     // declare the waterfall result as a full assembly, while 0.2.2 merges `tools`
     // afterwards and accepts the presentation returned here.
-    return filterPromptAssembly(assembly as AssembledPrompt, catalog, policy, enabled, sdk, instructions, appending) as PromptAssembly
+    const prepared = preparePromptAssembly(assembly as AssembledPrompt, catalog, policy, enabled, sdk, instructions, appending)
+    publisher.prepare(agent, prepared.catalog)
+    return prepared.assembly as PromptAssembly
+  })
+  /**
+   * Publish the catalog as this plugin's own message.
+   *
+   * The step waterfall is where the host admits the messages a step sends, so
+   * the catalog joins them there: it lands in the history after the cached
+   * prefix, and a change to it never rewrites the system prompt. Another
+   * plugin's runtime context cannot drag it along, because the host compares
+   * that context as one merged snapshot and this message is not part of it.
+   */
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject' || payload.signal.aborted)
+      return decision
+    admittedSessions.add(payload.agent.session)
+    const message = publisher.publish(payload.agent)
+    if (message === undefined)
+      return decision
+    return { ...decision, messages: [...decision.messages, message] }
   })
   ctx.on('tools/ptc-dispatch-log', async (dispatch, next) => {
     const content = await next()
@@ -294,6 +330,10 @@ export function installToolActivator(ctx: Context, config: ToolActivatorConfig):
     const state = announcements.get(session.id)
     if (state)
       foldAnnouncement(state, event)
+    // The host opens a step only after its admission waterfall ran: a step that
+    // starts without our listener seeing it means the waterfall is missing.
+    if (event.type === 'step/start' && assembledSessions.has(session) && !admittedSessions.has(session))
+      reportMissingStepAdmission()
     if (event.type !== 'turn/end')
       return
     for (const [token, value] of executions) {

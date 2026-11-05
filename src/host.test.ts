@@ -1,6 +1,6 @@
 import type { Fiber } from '@deepseek-ai/cordis'
 import type { Agent, Inbox } from '@deepseek-ai/dsh-agent'
-import type { ToolCallId as CallId } from '@deepseek-ai/dsh-llm'
+import type { ToolCallId as CallId, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { PtcRunRequest, PtcRunResult, PtcRunSpec } from '@deepseek-ai/dsh-ptc-runtime'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
@@ -14,7 +14,7 @@ import { AgentRegistry } from '@deepseek-ai/dsh-agent'
 import { createAssistantMessage, createToolResultMessage, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import { SandboxPolicyService, setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
-import { createScope } from '@deepseek-ai/dsh-scope'
+import { createScope, scopeTarget } from '@deepseek-ai/dsh-scope'
 import { SessionId, SessionStore } from '@deepseek-ai/dsh-session'
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import { SkillRegistry } from '@deepseek-ai/dsh-skill'
@@ -24,8 +24,9 @@ import { ApprovalService, setApprovalPolicy } from '@deepseek-ai/dsh-user-approv
 import { afterEach, describe, expect, it } from 'vitest'
 import { receiptFromContent } from './activation'
 import { Config } from './config'
-import { ACTIVATION_PROJECTION_KEY } from './constants'
+import { ACTIVATION_PROJECTION_KEY, ACTIVATOR_SOURCE_KIND } from './constants'
 import * as plugin from './index'
+import { catalogMessages } from './injection'
 
 const cleanups: Array<() => unknown> = []
 /** Absolute on every platform; DSH rejects a session header whose cwd is not absolute. */
@@ -87,6 +88,7 @@ interface Fixture {
   /** The agent that predates the plugin load, when the fixture created one. */
   restored: Driver | undefined
   setPolicy: (changes: Partial<ToolPolicy>) => void
+  setHostContext: (text: string) => void
 }
 
 function unused(): never {
@@ -208,7 +210,8 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
   cleanups.push(ctx.systemPrompt.section({ name: `tool:${DISCOVERABLE_TOOL}`, order: 100, text: DISCOVERABLE_GUIDE }))
   cleanups.push(ctx.systemPrompt.section({ name: 'tool:web_search', order: 100, text: 'WEB SEARCH FULL GUIDE' }))
   cleanups.push(ctx.systemPrompt.section({ name: 'host:safety', order: 1, text: 'HOST SAFETY NEVER REMOVED' }))
-  cleanups.push(ctx.systemPrompt.context({ name: 'host:runtime', order: 1, text: 'HOST RUNTIME NEVER REMOVED' }))
+  let hostContext = 'HOST RUNTIME NEVER REMOVED'
+  cleanups.push(ctx.systemPrompt.context({ name: 'host:runtime', order: 1, text: () => hostContext }))
   return {
     ctx,
     fiber,
@@ -217,6 +220,9 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
     restored,
     setPolicy(changes): void {
       current = Config(JSON.parse(JSON.stringify({ ...current, ...changes }))).get()
+    },
+    setHostContext(text: string): void {
+      hostContext = text
     },
   }
 }
@@ -250,7 +256,33 @@ async function call(ctx: Context, agent: Agent, name: string, args: unknown, id 
 
 async function presentation(ctx: Context, agent: Agent): Promise<{ names: string[], text: string }> {
   const assembly = await ctx.systemPrompt.assemble({ scope: agent, agent })
-  return { names: assembly.tools.map(tool => tool.name), text: `${renderPrompt(assembly)}\n${renderContextSnapshot(assembly)}` }
+  await admitStep(ctx, agent)
+  return { names: (assembly.tools ?? []).map(tool => tool.name), text: `${renderPrompt(assembly)}\n${renderContextSnapshot(assembly)}\n${catalogText(agent)}` }
+}
+
+/**
+ * Admit one step the way the host does: the step waterfall decides which
+ * messages enter the step, and the host appends them to the session.
+ */
+async function admitStep(ctx: Context, agent: Agent): Promise<UserMessage[]> {
+  const decision = await ctx.waterfall(
+    scopeTarget(agent, agent),
+    'agent/pre-step',
+    { agent, messages: [], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter' as const, messages: [] }),
+  )
+  if (decision.kind === 'reject')
+    return []
+  for (const message of decision.messages)
+    agent.session.append('user/message', message, { surfaceOp: 'append' })
+  return decision.messages
+}
+
+/** The catalog the model currently holds. */
+function catalogText(agent: Agent): string {
+  const messages = catalogMessages(agent)
+  const [block] = messages[messages.length - 1]?.content ?? []
+  return block?.type === 'text' ? block.text : ''
 }
 
 function closeTurn(session: Session): void {
@@ -449,21 +481,75 @@ describe('real rc.2 host contracts', () => {
     expect((await call(ctx, stale, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'Run the shell' })).isError).toBe(true)
   })
 
-  it('keeps the user complete prompt while delivering activated docs exactly once through runtime context', async () => {
+  it('keeps the user complete prompt while delivering activated docs exactly once through the catalog', async () => {
     const { ctx, makeAgent } = await fixture()
     cleanups.push(ctx.systemPrompt.section({ name: 'user:complete', order: 0, complete: true, text: 'USER COMPLETE PROMPT' }))
     const { agent } = await makeAgent('complete-prompt')
     await call(ctx, agent, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'Run the shell' })
     const assembly = await ctx.systemPrompt.assemble({ scope: agent, agent })
     expect(renderPrompt(assembly)).toBe('USER COMPLETE PROMPT')
-    expect(renderContextSnapshot(assembly)).toContain(DISCOVERABLE_GUIDE)
-    expect((renderPrompt(assembly) + renderContextSnapshot(assembly)).match(/PWSh FULL GUIDE/gu)).toHaveLength(1)
+    expect(renderContextSnapshot(assembly)).not.toContain(DISCOVERABLE_GUIDE)
+    const visible = await presentation(ctx, agent)
+    expect(visible.text.match(/PWSh FULL GUIDE/gu)).toHaveLength(1)
   })
 
-  it('fails explicitly instead of silently removing schemas when runtime context is suppressed', async () => {
+  it('keeps publishing the catalog when the host suppresses its runtime context', async () => {
     const { ctx, makeAgent } = await fixture({ runtimeContext: false })
     const { agent } = await makeAgent('no-runtime-context')
-    await expect(presentation(ctx, agent)).rejects.toThrow('requires runtime context')
+    const visible = await presentation(ctx, agent)
+    expect(visible.text).toContain('<available_tools')
+    expect(visible.text).not.toContain('HOST RUNTIME NEVER REMOVED')
+  })
+
+  it('publishes the catalog as its own message instead of a runtime context', async () => {
+    const { ctx, makeAgent } = await fixture()
+    const { agent } = await makeAgent('own-injection')
+    const assembly = await ctx.systemPrompt.assemble({ scope: agent, agent })
+    expect(assembly.contexts.map(context => context.name)).toEqual(['host:runtime'])
+    await presentation(ctx, agent)
+    const published = catalogMessages(agent)
+    expect(published).toHaveLength(1)
+    expect(published[0]!.source).toMatchObject({ kind: ACTIVATOR_SOURCE_KIND, form: 'catalog' })
+    expect(catalogText(agent)).toContain('<available_tools')
+  })
+
+  it('does not publish the catalog again while nothing changed', async () => {
+    const { ctx, makeAgent } = await fixture()
+    const { agent } = await makeAgent('stable-catalog')
+    await presentation(ctx, agent)
+    await presentation(ctx, agent)
+    expect(catalogMessages(agent)).toHaveLength(1)
+  })
+
+  it('publishes the catalog again once an activation changes it', async () => {
+    const { ctx, makeAgent } = await fixture()
+    const { agent } = await makeAgent('changed-catalog')
+    await presentation(ctx, agent)
+    await call(ctx, agent, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'Run the shell' })
+    await presentation(ctx, agent)
+    expect(catalogMessages(agent)).toHaveLength(2)
+    expect(catalogText(agent)).toContain(`<tool identifier="${DISCOVERABLE_TOOL}" names="${DISCOVERABLE_TOOL}"/>`)
+  })
+
+  it('keeps its catalog when another contributor changes the runtime context', async () => {
+    const { ctx, makeAgent, setHostContext } = await fixture()
+    const { agent } = await makeAgent('foreign-context')
+    await presentation(ctx, agent)
+    setHostContext('HOST RUNTIME CHANGED')
+    const visible = await presentation(ctx, agent)
+    expect(visible.text).toContain('HOST RUNTIME CHANGED')
+    expect(catalogMessages(agent)).toHaveLength(1)
+  })
+
+  it('does not publish the same catalog twice in a restored session', async () => {
+    const { ctx, makeAgent } = await fixture()
+    const original = await makeAgent('catalog-source-session')
+    await presentation(ctx, original.agent)
+    closeTurn(original.agent.session)
+    const serialized: SessionEvent[] = JSON.parse(JSON.stringify(original.events))
+    const restored = await makeAgent('catalog-restored-session', serialized)
+    await presentation(ctx, restored.agent)
+    expect(catalogMessages(restored.agent)).toHaveLength(1)
   })
 
   it('unloads every registration and rebuilds durable state on plugin reload', async () => {
@@ -474,7 +560,9 @@ describe('real rc.2 host contracts', () => {
     expect(ctx.tools.get('activate_tools', agent)).toBeUndefined()
     expect(ctx.sessionProjections.stateOf(agent.session, 'tool-activator:activation')).toBeUndefined()
     const without = await ctx.systemPrompt.assemble({ scope: agent, agent })
-    expect(without.contexts.map(context => context.name)).not.toContain('tool-activator:context')
+    // The plugin contributes no runtime context of its own: the catalog travels
+    // as its own message, so only the host's context is left.
+    expect(without.contexts.map(context => context.name)).toEqual(['host:runtime'])
     const reloaded = await ctx.plugin({ inject: plugin.inject, apply: (owner: Context): void => plugin.apply(owner, Config({ requireApproval: false })) })
     cleanups.push(() => reloaded.dispose())
     expect((await presentation(ctx, agent)).names).toEqual(['activate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'write'])
@@ -886,11 +974,6 @@ describe('activating a tool refreshes the declaration list for the next inferenc
  * declarations, so this block emulates the newer contract instead.
  */
 describe('the 0.2.2 contract: the waterfall carries no tool declarations', () => {
-  async function promptText(ctx: Context, agent: Agent): Promise<string> {
-    const assembly = await ctx.systemPrompt.assemble({ scope: agent, agent })
-    return `${renderPrompt(assembly)}\n${renderContextSnapshot(assembly)}`
-  }
-
   it('keeps the restored activations visible on the very first read of a restored session', async () => {
     const { ctx, makeAgent } = await fixture({ withoutDeclarations: true })
     // The host contract is learned from the first scoped assembly; in production
@@ -911,7 +994,7 @@ describe('the 0.2.2 contract: the waterfall carries no tool declarations', () =>
     const { ctx, makeAgent } = await fixture({ withoutDeclarations: true })
     const { agent } = await makeAgent('new-session')
 
-    const text = await promptText(ctx, agent)
+    const { text } = await presentation(ctx, agent)
     // The directory is what makes `activate_tools` usable at all: the model has to
     // see which tools exist before it can ask for them.
     expect(text).toContain('<available_tools description="These tools are installed but not yet enabled. Use activate_tools to enable them when needed.">')
