@@ -11,6 +11,7 @@ function policy(groups: readonly ToolGroup[]): ToolPolicy {
     basicTools: ['read'],
     requireApproval: true,
     autoGroupMcp: true,
+    passiveRelease: { enabled: true, idleTurns: 6, maxActivatedTools: 24 },
     groups,
     sectionTools: {},
   }
@@ -28,6 +29,7 @@ describe('config', () => {
       basicTools: ['read', 'glob', 'grep', 'write', 'edit', 'skill', 'ask_user_question', 'todo_write'],
       requireApproval: true,
       autoGroupMcp: true,
+      passiveRelease: { enabled: true, idleTurns: 6, maxActivatedTools: 24 },
       groups: [],
       sectionTools: {},
     })
@@ -39,6 +41,7 @@ describe('config', () => {
       basicTools: [],
       requireApproval: false,
       autoGroupMcp: false,
+      passiveRelease: { enabled: true, idleTurns: 6, maxActivatedTools: 24 },
       groups: [],
       sectionTools: {},
     })
@@ -53,6 +56,7 @@ describe('config', () => {
       basicTools: ['read', 'read'],
       requireApproval: true,
       autoGroupMcp: true,
+      passiveRelease: { enabled: true, idleTurns: 6, maxActivatedTools: 24 },
       groups: [{ identifier: 'plugin.files-2', name: '', description: '', tools: ['mcp__files__read', 'not_in_current_scope'], sections: [] }],
       sectionTools: { 'plugin:files': ['mcp__files__read'], 'tool:none': [] },
     })
