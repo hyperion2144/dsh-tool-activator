@@ -14,7 +14,7 @@ import { AgentRegistry } from '@deepseek-ai/dsh-agent'
 import { createAssistantMessage, createToolResultMessage, projectToolUpdates, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { PtcRuntime } from '@deepseek-ai/dsh-ptc-runtime'
 import { SandboxPolicyService, setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
-import { createScope } from '@deepseek-ai/dsh-scope'
+import { createScope, scopeTarget } from '@deepseek-ai/dsh-scope'
 import { SessionId, SessionStore } from '@deepseek-ai/dsh-session'
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import { SkillRegistry } from '@deepseek-ai/dsh-skill'
@@ -24,8 +24,9 @@ import { ApprovalService, setApprovalPolicy } from '@deepseek-ai/dsh-user-approv
 import { afterEach, describe, expect, it } from 'vitest'
 import { receiptFromContent } from './activation'
 import { Config } from './config'
-import { ACTIVATION_PROJECTION_KEY } from './constants'
+import { ACTIVATION_PROJECTION_KEY, ACTIVATOR_SOURCE_KIND, GROUPING_TOOL_NAME } from './constants'
 import * as plugin from './index'
+import { releaseReceiptFromContent } from './release'
 
 const cleanups: Array<() => unknown> = []
 /** Absolute on every platform; DSH rejects a session header whose cwd is not absolute. */
@@ -67,6 +68,7 @@ interface FixtureOptions {
   skills?: boolean
   runtimeContext?: boolean
   spill?: boolean
+  withoutDeclarations?: boolean
 }
 
 interface Driver {
@@ -138,6 +140,17 @@ async function fixture(options: FixtureOptions = {}): Promise<Fixture> {
     },
   })
   services.push(fiber)
+  if (options.withoutDeclarations) {
+    // dsh 0.2.2 hands the waterfall a presentation WITHOUT tool declarations and
+    // merges the provider-owned schemas afterwards. Deleting the declarations in
+    // place emulates that contract for the rc.2 fixture. The hook has to run
+    // BEFORE the plugin's own probe — that probe reads the declarations off the
+    // payload to learn whether the host owns them — hence `prepend`.
+    cleanups.push(ctx.on('system-prompt/assemble', async (assembly, _context, next) => {
+      Reflect.deleteProperty(assembly, 'tools')
+      return next()
+    }, { prepend: true }))
+  }
   for (const name of ['read', 'write', 'glob', 'grep', DISCOVERABLE_TOOL, 'web_search']) {
     cleanups.push(ctx.tools.register(defineTool({
       name,
@@ -227,9 +240,41 @@ async function call(ctx: Context, agent: Agent, name: string, args: unknown, id 
   return result
 }
 
-async function presentation(ctx: Context, agent: Agent): Promise<{ names: string[], text: string }> {
+/**
+ * Admit one step the way the host does: the pre-step waterfall merges the
+ * catalog message into the step, and the harness appends it to the session.
+ */
+async function admitStep(ctx: Context, agent: Agent): Promise<void> {
+  const decision = await ctx.waterfall(
+    scopeTarget(agent, agent),
+    'agent/pre-step',
+    { agent, messages: [], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter' as const, messages: [] }),
+  )
+  if (decision.kind === 'reject')
+    return
+  for (const message of decision.messages)
+    agent.session.append('user/message', message, { surfaceOp: 'append' })
+}
+
+async function presentation(ctx: Context, agent: Agent): Promise<{ names: string[], text: string, catalog: string }> {
   const assembly = await ctx.systemPrompt.assemble({ scope: agent, agent })
-  return { names: assembly.tools.map(tool => tool.name), text: `${renderPrompt(assembly)}\n${renderContextSnapshot(assembly)}` }
+  await admitStep(ctx, agent)
+  // The catalog travels as the plugin's own message, not inside the assembly:
+  // the assertions below read them together, the way the model sees them.
+  const catalogs = agent.session.deriveMessages()
+    .filter(message => message.role === 'user' && (message.source as { kind?: unknown } | undefined)?.kind === ACTIVATOR_SOURCE_KIND)
+    .map(message => message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join(''))
+  // 模型只读最新一份目录：旧目录已被 supersede，不进判定文本。
+  const catalog = catalogs[catalogs.length - 1] ?? ''
+  return { names: (assembly.tools ?? []).map(tool => tool.name), text: `${renderPrompt(assembly)}\n${renderContextSnapshot(assembly)}\n${catalog}`, catalog }
+}
+
+function catalogTextOf(agent: Agent): string {
+  const catalogs = agent.session.deriveMessages()
+    .filter(message => message.role === 'user' && (message.source as { kind?: unknown } | undefined)?.kind === ACTIVATOR_SOURCE_KIND)
+    .map(message => message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join(''))
+  return catalogs[catalogs.length - 1] ?? ''
 }
 
 function closeTurn(session: Session): void {
@@ -255,7 +300,7 @@ describe('real rc.2 host contracts', () => {
     const { ctx, makeAgent } = await fixture()
     const { agent } = await makeAgent('initial')
     const initial = await presentation(ctx, agent)
-    expect(initial.names).toEqual(['activate_tools', 'glob', 'grep', 'read', 'write'])
+    expect(initial.names).toEqual(['activate_tools', 'deactivate_tools', 'glob', 'grep', 'read', 'write'])
     expect(initial.text).toContain(`<tool identifier="${DISCOVERABLE_TOOL}" name="${DISCOVERABLE_TOOL}">${DISCOVERABLE_TOOL}: ${DISCOVERABLE_TOOL} description</tool>`)
     expect(initial.text).toContain('READ FULL GUIDE')
     expect(initial.text).toContain('WRITE FULL GUIDE')
@@ -263,6 +308,55 @@ describe('real rc.2 host contracts', () => {
     expect(initial.text).toContain('HOST SAFETY NEVER REMOVED')
     expect(initial.text).toContain('HOST RUNTIME NEVER REMOVED')
     expect(ctx.tools.get(DISCOVERABLE_TOOL, agent)).toBeDefined()
+  })
+
+  it('releases an activated entry, refuses its tools, and restores them on re-activation', async () => {
+    // withoutDeclarations：现代宿主路径，装配即刷新准入（guard 随之对齐）。
+    const { ctx, makeAgent } = await fixture({ withoutDeclarations: true })
+    const { agent } = await makeAgent('release-e2e')
+    await call(ctx, agent, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'Run the shell' })
+    // 镜像生产时序：激活与释放之间有装配（seen 记住了 pwsh），释放后不得被
+    // 并集加回模型面。
+    await presentation(ctx, agent)
+
+    const result = await call(ctx, agent, 'deactivate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'The shell is no longer needed' })
+    expect(result.isError).toBe(false)
+    const released = releaseReceiptFromContent(result.content)
+    expect(released?.success).toBe(true)
+    expect(released?.released.identifiers).toEqual([DISCOVERABLE_TOOL])
+    expect(released?.released.toolNames).toEqual([DISCOVERABLE_TOOL])
+
+    // addition-only 路由（夹具模型无 toolUpdate）：声明与 seen 保持——移除无从
+    // 公告，释放的真实效果是账目回收 + 条目回到待激活目录，由回执告知模型。
+    const after = await presentation(ctx, agent)
+    // 账目回收的直接证据：释放的条目回到待激活目录，模型可再次激活。
+    expect(after.catalog).toContain(`tool identifier="${DISCOVERABLE_TOOL}"`)
+
+    // 释放必须真的收走模型面：guard 拒绝已释放工具（P6：seen 并集不得把
+    // 释放的名字加回模型面）。
+    const refused = await call(ctx, agent, DISCOVERABLE_TOOL, {}, 'released-tool-call')
+    expect(refused.isError).toBe(true)
+    expect(refused.content.some(block => block.type === 'text' && block.text.includes('not activated in this session'))).toBe(true)
+
+    // 目录消息三面对齐：点名释放记录，并离开已激活段。
+    expect(after.catalog).toContain('<released_tools>')
+    expect(after.catalog).not.toContain(`<activated_tools>\n  <tool identifier="${DISCOVERABLE_TOOL}"`)
+
+    // 重新激活一切照常：回执不再报 alreadyReleased。
+    const again = await call(ctx, agent, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'Need the shell again' })
+    expect(receiptFromContent(again.content)?.state.activatedTools.map(tool => tool.identifier)).toEqual([DISCOVERABLE_TOOL])
+  })
+
+  it('makes an activated group_tools callable (P7)', async () => {
+    const { ctx, makeAgent } = await fixture()
+    const { agent } = await makeAgent('group-tools-activate')
+    const result = await call(ctx, agent, 'activate_tools', { identifiers: [GROUPING_TOOL_NAME], reason: 'The user asked to regroup the tools' })
+    expect(result.isError, JSON.stringify(result)).toBe(false)
+    expect(receiptFromContent(result.content)?.state.activatedTools.map(tool => tool.identifier)).toEqual([GROUPING_TOOL_NAME])
+
+    // 激活提交后模型即可调用（刷新链路对插件自有工具同样成立）。
+    const listed = await call(ctx, agent, GROUPING_TOOL_NAME, { action: 'list' }, 'group-tools-call')
+    expect(listed.isError, JSON.stringify(listed.content)).toBe(false)
   })
 
   it('commits only a final native receipt and presents schemas plus instructions on the next request', async () => {
@@ -280,10 +374,12 @@ describe('real rc.2 host contracts', () => {
     })
     expect(events.map(event => event.type)).toEqual(['turn/start', 'step/start', 'assistant/message', 'tool/call', 'tool/result'])
     const enabled = await presentation(ctx, agent)
-    expect(enabled.names).toEqual(['activate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'write'])
+    expect(enabled.names).toEqual(['activate_tools', 'deactivate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'write'])
     expect(enabled.text).toContain(DISCOVERABLE_GUIDE)
     expect(enabled.text.match(/WRITE FULL GUIDE/gu)).toHaveLength(1)
-    expect(enabled.text).toContain('<available_tools description="These tools are installed but not yet enabled. Use activate_tools to enable them when needed.">\n  <tool identifier="web_search" name="web_search">web_search: web_search description</tool>\n</available_tools>')
+    expect(enabled.text).toContain('<available_tools description="These tools are installed but not yet enabled. Use activate_tools to enable them when needed.')
+    expect(enabled.text).toContain('<tool identifier="group_tools" name="group_tools">')
+    expect(enabled.text).toContain('<tool identifier="web_search" name="web_search">web_search: web_search description</tool>')
     expect(enabled.text).not.toContain(`<tool identifier="${DISCOVERABLE_TOOL}" name="${DISCOVERABLE_TOOL}">`)
     const again = await call(ctx, agent, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL, 'missing'], reason: 'Check the tools' }, 'already-active')
     expect(receiptFromContent(again.content)?.state).toEqual({ activatedTools: [], activatedSkills: [], alreadyActive: [DISCOVERABLE_TOOL], notFound: ['missing'] })
@@ -309,8 +405,8 @@ describe('real rc.2 host contracts', () => {
     const serialized: SessionEvent[] = JSON.parse(JSON.stringify(original.events))
     const restored = await makeAgent('restored-session', serialized)
     const fresh = await makeAgent('fresh-session')
-    expect((await presentation(ctx, restored.agent)).names).toEqual(['activate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'write'])
-    expect((await presentation(ctx, fresh.agent)).names).toEqual(['activate_tools', 'glob', 'grep', 'read', 'write'])
+    expect((await presentation(ctx, restored.agent)).names).toEqual(['activate_tools', 'deactivate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'write'])
+    expect((await presentation(ctx, fresh.agent)).names).toEqual(['activate_tools', 'deactivate_tools', 'glob', 'grep', 'read', 'write'])
   })
 
   it('restores only the current restricted scope and refuses unavailable identifiers', async () => {
@@ -380,7 +476,7 @@ describe('real rc.2 host contracts', () => {
     const result = await call(ctx, agent, 'activate_tools', { identifiers: ['files'], reason: 'Use file utilities' })
     expect(receiptFromContent(result.content)?.state.activatedTools).toEqual([{ identifier: 'files', name: 'Files', apiCount: 3 }])
     const enabled = await presentation(ctx, agent)
-    expect(enabled.names).toEqual(['activate_tools', 'grep', 'pwsh', 'read', 'web_search'])
+    expect(enabled.names).toEqual(['activate_tools', 'deactivate_tools', 'grep', 'pwsh', 'read', 'web_search'])
     expect(enabled.text).not.toContain('SHARED HIDDEN GUIDE')
     expect(enabled.text).not.toContain('WRITE FULL GUIDE')
     expect(enabled.text).toContain('WEB SEARCH FULL GUIDE')
@@ -393,7 +489,7 @@ describe('real rc.2 host contracts', () => {
 
     setPolicy({ basicTools: [] })
     const pending = await presentation(ctx, agent)
-    expect(pending.names).toEqual(['activate_tools'])
+    expect(pending.names).toEqual(['activate_tools', 'deactivate_tools'])
     expect(pending.text).toContain('<tool identifier="read" name="read">')
     expect(pending.text).not.toContain('READ FULL GUIDE')
     expect(pending.text).not.toContain('WRITE FULL GUIDE')
@@ -401,12 +497,12 @@ describe('real rc.2 host contracts', () => {
     const result = await call(ctx, agent, 'activate_tools', { identifiers: ['read'], reason: 'Read a file on demand' })
     expect(result.isError).toBe(false)
     const activated = await presentation(ctx, agent)
-    expect(activated.names).toEqual(['activate_tools', 'read'])
+    expect(activated.names).toEqual(['activate_tools', 'deactivate_tools', 'read'])
     expect(activated.text).toContain('READ FULL GUIDE')
     expect(activated.text).not.toContain('WRITE FULL GUIDE')
 
     const fresh = await makeAgent('empty-basics-fresh')
-    expect((await presentation(ctx, fresh.agent)).names).toEqual(['activate_tools'])
+    expect((await presentation(ctx, fresh.agent)).names).toEqual(['activate_tools', 'deactivate_tools'])
   })
 
   it('keeps a committed activation when the configuration is unchanged', async () => {
@@ -422,27 +518,25 @@ describe('real rc.2 host contracts', () => {
     const { ctx, makeAgent } = await fixture()
     const { agent } = await makeAgent('scope-identity')
     await expect(ctx.systemPrompt.assemble({ scope: {}, agent })).rejects.toThrow('exact agent scope')
-    expect((await ctx.systemPrompt.assemble()).tools.map(tool => tool.name)).toEqual(['activate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'web_search', 'write'])
+    expect((await ctx.systemPrompt.assemble()).tools.map(tool => tool.name)).toEqual(['activate_tools', 'deactivate_tools', 'glob', 'grep', 'group_tools', DISCOVERABLE_TOOL, 'read', 'web_search', 'write'])
     const stale = { ...agent }
     await expect(ctx.systemPrompt.assemble({ scope: stale, agent: stale })).rejects.toThrow('exact live agent')
     expect((await call(ctx, stale, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'Run the shell' })).isError).toBe(true)
   })
 
-  it('keeps the user complete prompt while delivering activated docs exactly once through runtime context', async () => {
+  it('keeps the user complete prompt while delivering activated docs exactly once through the catalog message', async () => {
     const { ctx, makeAgent } = await fixture()
     cleanups.push(ctx.systemPrompt.section({ name: 'user:complete', order: 0, complete: true, text: 'USER COMPLETE PROMPT' }))
     const { agent } = await makeAgent('complete-prompt')
     await call(ctx, agent, 'activate_tools', { identifiers: [DISCOVERABLE_TOOL], reason: 'Run the shell' })
+    // 真实顺序：装配（prepare）先于准入（publish）。
     const assembly = await ctx.systemPrompt.assemble({ scope: agent, agent })
+    await admitStep(ctx, agent)
+    // 用户的完整 section 不被工具装配改写；激活文档随目录消息走，且恰好出现一次。
     expect(renderPrompt(assembly)).toBe('USER COMPLETE PROMPT')
-    expect(renderContextSnapshot(assembly)).toContain(DISCOVERABLE_GUIDE)
-    expect((renderPrompt(assembly) + renderContextSnapshot(assembly)).match(/PWSh FULL GUIDE/gu)).toHaveLength(1)
-  })
-
-  it('fails explicitly instead of silently removing schemas when runtime context is suppressed', async () => {
-    const { ctx, makeAgent } = await fixture({ runtimeContext: false })
-    const { agent } = await makeAgent('no-runtime-context')
-    await expect(presentation(ctx, agent)).rejects.toThrow('requires runtime context')
+    const catalog = catalogTextOf(agent)
+    expect(catalog).toContain(DISCOVERABLE_GUIDE)
+    expect((renderPrompt(assembly) + renderContextSnapshot(assembly) + catalog).match(/PWSh FULL GUIDE/gu)).toHaveLength(1)
   })
 
   it('unloads every registration and rebuilds durable state on plugin reload', async () => {
@@ -456,7 +550,7 @@ describe('real rc.2 host contracts', () => {
     expect(without.contexts.map(context => context.name)).not.toContain('tool-activator:context')
     const reloaded = await ctx.plugin({ inject: plugin.inject, apply: (owner: Context): void => plugin.apply(owner, Config({ requireApproval: false })) })
     cleanups.push(() => reloaded.dispose())
-    expect((await presentation(ctx, agent)).names).toEqual(['activate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'write'])
+    expect((await presentation(ctx, agent)).names).toEqual(['activate_tools', 'deactivate_tools', 'glob', 'grep', DISCOVERABLE_TOOL, 'read', 'write'])
   })
 })
 
@@ -769,6 +863,62 @@ describe('real skill fallback and result policy', () => {
   })
 })
 
+describe('route capability probing', () => {
+  // 观察面：探测调用计数。「未知不落缓存」= 两次装配探测两次；「结论只探
+  // 一次」= 命中缓存后不再探测。这正是 P3 要的行为分界。
+  it('re-probes after a failed resolveModelInfo instead of latching filter', async () => {
+    const { ctx, makeAgent } = await fixture()
+    let fail = true
+    let calls = 0
+    cleanups.push(ctx.provide('llm', {
+      resolveModelInfo: async () => {
+        calls += 1
+        if (fail)
+          throw new Error('llm warming up')
+        return { toolUpdate: 'addition-only' }
+      },
+    }))
+    const { agent } = await makeAgent('probe-retry')
+    agent.options.provider = 'fixture'
+    agent.options.model = 'fixture'
+
+    // 两次装配、两次探测：抛错的否定结论不落缓存。
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    expect(calls).toBe(2)
+
+    // 拿到明确结论后才落缓存：此后不再探测。
+    fail = false
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    expect(calls).toBe(3)
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    expect(calls).toBe(3)
+  })
+
+  it('does not pin an agent to filter when provider and model are unknown', async () => {
+    const { ctx, makeAgent } = await fixture()
+    let calls = 0
+    cleanups.push(ctx.provide('llm', {
+      resolveModelInfo: async () => {
+        calls += 1
+        return { toolUpdate: 'addition-only' }
+      },
+    }))
+    const { agent } = await makeAgent('probe-no-route')
+
+    // 首步 provider/model 未知：探测根本不触达 llm，也不落缓存。
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    expect(calls).toBe(0)
+
+    // 路由信息就位后：下一次装配重探成功（没有被永久钉死在 filter）。
+    agent.options.provider = 'fixture'
+    agent.options.model = 'fixture'
+    await ctx.systemPrompt.assemble({ scope: agent, agent })
+    expect(calls).toBe(1)
+  })
+})
+
 describe('cache-stable declarations on a route that reads mid-conversation tool changes', () => {
   it('announces the activation instead of rewriting the request head', async () => {
     const { ctx, makeAgent } = await fixture()
@@ -788,7 +938,7 @@ describe('cache-stable declarations on a route that reads mid-conversation tool 
     const after = await ctx.systemPrompt.assemble({ scope: agent, agent })
     expect(after.tools).toEqual(initial.tools)
     expect(after.tools.find(tool => tool.name === DISCOVERABLE_TOOL)?.deferLoading).toBe(true)
-    expect(after.tools.filter(tool => tool.deferLoading !== true).map(tool => tool.name)).toEqual(['activate_tools', 'glob', 'grep', 'read', 'write'])
+    expect(after.tools.filter(tool => tool.deferLoading !== true).map(tool => tool.name)).toEqual(['activate_tools', 'deactivate_tools', 'glob', 'grep', 'read', 'write'])
 
     const announcement = events.filter(event => event.type === 'developer/message')
     expect(announcement).toHaveLength(1)

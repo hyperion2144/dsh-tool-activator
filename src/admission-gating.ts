@@ -172,8 +172,11 @@ export function installAdmissionGating(tools: unknown): AdmissionGate | undefine
       const agent = context.agent
       // The presentation has to be decided before the host derives this step's
       // declarations from it: deciding it one step later would change the head
-      // once, which is the whole cost this gate exists to avoid.
-      if (agent !== undefined && !allowed.has(agent) && resolver !== undefined)
+      // once, which is the whole cost this gate exists to avoid. The resolver
+      // runs on EVERY resolve — a one-shot run would freeze the allow-list at
+      // the first step, and an activation committing mid-session would only
+      // reach the model one step late on filter routes.
+      if (agent !== undefined && resolver !== undefined)
         await resolver(agent)
       const toolSet = await original.call(this, context)
       const allow = agent === undefined ? undefined : allowed.get(agent)

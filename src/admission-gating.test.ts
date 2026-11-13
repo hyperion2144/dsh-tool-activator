@@ -166,7 +166,7 @@ describe('installAdmissionGating', () => {
     expect(resolve).toHaveBeenCalledTimes(1)
   })
 
-  it('stops resolving once an allow-list exists', async () => {
+  it('re-resolves on every admission so a refreshed allow-list reaches the same step', async () => {
     const tools = new FakeTools()
     const gate = installAdmissionGating(tools)!
     const owner = agent('settled')
@@ -174,9 +174,15 @@ describe('installAdmissionGating', () => {
     gate.setResolver(resolve)
     gate.setAllowed(owner, new Set(['read', 'write']))
 
+    // allow-list 会随释放与重激活变化：每次解析都刷新，一步都不许滞后——
+    // 一次性执行会把激活冻结在首个 allow-list 上，filter 路由慢一拍。
     const toolSet = await tools.resolve({ agent: owner })
     expect([...toolSet.view(owner).keys()]).toEqual(['read', 'write'])
-    expect(resolve).not.toHaveBeenCalled()
+    expect(resolve).toHaveBeenCalledTimes(1)
+
+    const second = await tools.resolve({ agent: owner })
+    expect([...second.view(owner).keys()]).toEqual(['read', 'write'])
+    expect(resolve).toHaveBeenCalledTimes(2)
   })
 
   it('leaves an agent it does not manage alone', async () => {

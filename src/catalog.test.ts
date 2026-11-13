@@ -2,12 +2,14 @@ import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { ToolGroup, ToolPolicy } from './shared'
 import { describe, expect, it } from 'vitest'
 import { availableToolsForDiscovery, buildToolCatalog, enabledToolNames, sectionToolDependencies } from './catalog'
+import { DEFAULT_PASSIVE_RELEASE } from './shared'
 
 function policy(overrides: Partial<ToolPolicy> = {}): ToolPolicy {
   return {
     basicTools: ['read'],
     requireApproval: true,
     autoGroupMcp: true,
+    passiveRelease: { ...DEFAULT_PASSIVE_RELEASE },
     groups: [],
     sectionTools: {},
     ...overrides,
@@ -189,6 +191,7 @@ describe('enabledToolNames', () => {
 
     expect([...enabledToolNames(catalog, current, ['web', 'unknown', 'write'])].sort()).toEqual([
       'activate_tools',
+      'deactivate_tools',
       'read',
       'run_code',
       'web_fetch',
@@ -200,8 +203,8 @@ describe('enabledToolNames', () => {
     const current = policy({ groups: [group('editor', ['read', 'write'])] })
     const catalog = buildToolCatalog([tool('read'), tool('write')], current)
 
-    expect([...enabledToolNames(catalog, current, [])].sort()).toEqual(['activate_tools', 'read', 'run_code'])
-    expect([...enabledToolNames(catalog, current, ['editor', 'editor'])].sort()).toEqual(['activate_tools', 'read', 'run_code', 'write'])
+    expect([...enabledToolNames(catalog, current, [])].sort()).toEqual(['activate_tools', 'deactivate_tools', 'read', 'run_code'])
+    expect([...enabledToolNames(catalog, current, ['editor', 'editor'])].sort()).toEqual(['activate_tools', 'deactivate_tools', 'read', 'run_code', 'write'])
   })
 })
 
